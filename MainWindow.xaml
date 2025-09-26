@@ -153,7 +153,14 @@
                 </Grid.RowDefinitions>
 
                 <!-- Piano Keyboard -->
-                <Grid x:Name="PianoPanel" Grid.Row="0" Background="Transparent" Height="100" Width="500" Visibility="Collapsed" Margin="0,8,0,0">
+                <Grid x:Name="PianoPanel" Grid.Row="0" Background="Transparent" Height="100" Width="500" Visibility="Collapsed" Margin="0,8,0,0"
+                    PreviewMouseLeftButtonDown="PianoPanel_PreviewMouseLeftButtonDown"
+                    PreviewMouseLeftButtonUp="PianoPanel_PreviewMouseLeftButtonUp"
+                    MouseMove="PianoPanel_MouseMove"
+                    TouchDown="PianoPanel_TouchDown"
+                    TouchMove="PianoPanel_TouchMove"
+                    TouchUp="PianoPanel_TouchUp"
+                    IsManipulationEnabled="True">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition/>
                         <ColumnDefinition/>
@@ -198,7 +205,6 @@
                         <ColumnDefinition/>
                         <ColumnDefinition/>
                     </Grid.ColumnDefinitions>
-
                     <Grid.Resources>
                         <Style x:Key="WhiteKeyStyle" TargetType="Button">
                             <Setter Property="Background" Value="White"/>
@@ -209,31 +215,33 @@
                             <Setter Property="Padding" Value="0"/>
                             <Setter Property="Margin" Value="1,0,1,0"/>
                             <Setter Property="Grid.ColumnSpan" Value="3"/>
-                            <Setter Property="Cursor" Value="Hand"/>
                             <Setter Property="Template">
                                 <Setter.Value>
                                     <ControlTemplate TargetType="Button">
-                                        <Border x:Name="Bd"
-                        Background="{TemplateBinding Background}"
-                        BorderBrush="{TemplateBinding BorderBrush}"
-                        BorderThickness="{TemplateBinding BorderThickness}"
-                        CornerRadius="04">
-                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        <Border x:Name="HitArea"
+                                            Background="Transparent"
+                                            SnapsToDevicePixels="True"
+                                            CornerRadius="0,0,4,4">
+                                            <Border x:Name="Bd"
+                                                IsHitTestVisible="False"
+                                                Background="{TemplateBinding Background}"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="{TemplateBinding BorderThickness}"
+                                                CornerRadius="0,0,4,4"
+                                                RenderTransformOrigin="0.5,0.0">
+                                                <Border.RenderTransform>
+                                                    <ScaleTransform ScaleX="1.0" ScaleY="1.0"/>
+                                                </Border.RenderTransform>
+
+                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                            </Border>
                                         </Border>
-                                        <ControlTemplate.Triggers>
-                                            <Trigger Property="IsPressed" Value="True">
-                                                <Setter TargetName="Bd" Property="Background" Value="#DDD"/>
-                                                <Setter TargetName="Bd" Property="RenderTransform">
-                                                    <Setter.Value>
-                                                        <ScaleTransform ScaleY="0.95"/>
-                                                    </Setter.Value>
-                                                </Setter>
-                                            </Trigger>
-                                        </ControlTemplate.Triggers>
                                     </ControlTemplate>
                                 </Setter.Value>
                             </Setter>
                         </Style>
+
+                        <!-- Black key style -->
                         <Style x:Key="BlackKeyStyle" TargetType="Button">
                             <Setter Property="Background" Value="Black"/>
                             <Setter Property="Foreground" Value="White"/>
@@ -245,58 +253,59 @@
                             <Setter Property="Height" Value="60"/>
                             <Setter Property="Grid.ColumnSpan" Value="2"/>
                             <Setter Property="Panel.ZIndex" Value="2"/>
-                            <Setter Property="Cursor" Value="Hand"/>
                             <Setter Property="Template">
                                 <Setter.Value>
                                     <ControlTemplate TargetType="Button">
-                                        <Border x:Name="Bd"
-                        Background="{TemplateBinding Background}"
-                        BorderBrush="{TemplateBinding BorderBrush}"
-                        BorderThickness="{TemplateBinding BorderThickness}"
-                        CornerRadius="0,0,4,4">
-                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        <Border x:Name="HitArea"
+                                            Background="Transparent"
+                                            SnapsToDevicePixels="True"
+                                            CornerRadius="0,0,4,4">
+                                            <Border x:Name="Bd"
+                                                IsHitTestVisible="False"
+                                                Background="{TemplateBinding Background}"
+                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                BorderThickness="{TemplateBinding BorderThickness}"
+                                                CornerRadius="0,0,4,4"
+                                                RenderTransformOrigin="0.5,0.0">
+                                                <Border.RenderTransform>
+                                                    <ScaleTransform ScaleX="1.0" ScaleY="1.0"/>
+                                                </Border.RenderTransform>
+
+                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                            </Border>
                                         </Border>
-                                        <ControlTemplate.Triggers>
-                                            <Trigger Property="IsPressed" Value="True">
-                                                <Setter TargetName="Bd" Property="Background" Value="#222"/>
-                                                <Setter TargetName="Bd" Property="RenderTransform">
-                                                    <Setter.Value>
-                                                        <ScaleTransform ScaleY="0.95"/>
-                                                    </Setter.Value>
-                                                </Setter>
-                                            </Trigger>
-                                        </ControlTemplate.Triggers>
                                     </ControlTemplate>
                                 </Setter.Value>
                             </Setter>
                         </Style>
                     </Grid.Resources>
 
+
                     <!-- Touches blanches -->
-                    <Button Grid.Column="0" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="53" />
-                    <Button Grid.Column="2" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="54" />
-                    <Button Grid.Column="3" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="55" />
-                    <Button Grid.Column="5" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="56" />
-                    <Button Grid.Column="6" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="57" />
-                    <Button Grid.Column="8" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="58" />
-                    <Button Grid.Column="9" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="59" />
-                    <Button Grid.Column="12" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="60" />
-                    <Button Grid.Column="14" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="61" />
-                    <Button Grid.Column="15" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="62" />
-                    <Button Grid.Column="17" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="63" />
-                    <Button Grid.Column="18" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="64" />
-                    <Button Grid.Column="21" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="65" />
-                    <Button Grid.Column="23" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="66" />
-                    <Button Grid.Column="24" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="67" />
-                    <Button Grid.Column="26" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="68" />
-                    <Button Grid.Column="27" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="69" />
-                    <Button Grid.Column="29" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="70" />
-                    <Button Grid.Column="30" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="71" />
-                    <Button Grid.Column="33" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="72" />
-                    <Button Grid.Column="35" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="73" />
-                    <Button Grid.Column="36" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="74" />
-                    <Button Grid.Column="38" Style="{StaticResource BlackKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="75" />
-                    <Button Grid.Column="39" Style="{StaticResource WhiteKeyStyle}" PreviewMouseDown="PianoKey_Down" PreviewMouseUp="PianoKey_Up" Tag="76" />
+                    <Button Grid.Column="0" Style="{StaticResource WhiteKeyStyle}" Tag="53" />
+                    <Button Grid.Column="2" Style="{StaticResource BlackKeyStyle}" Tag="54" />
+                    <Button Grid.Column="3" Style="{StaticResource WhiteKeyStyle}" Tag="55" />
+                    <Button Grid.Column="5" Style="{StaticResource BlackKeyStyle}" Tag="56" />
+                    <Button Grid.Column="6" Style="{StaticResource WhiteKeyStyle}" Tag="57" />
+                    <Button Grid.Column="8" Style="{StaticResource BlackKeyStyle}" Tag="58" />
+                    <Button Grid.Column="9" Style="{StaticResource WhiteKeyStyle}" Tag="59" />
+                    <Button Grid.Column="12" Style="{StaticResource WhiteKeyStyle}" Tag="60" />
+                    <Button Grid.Column="14" Style="{StaticResource BlackKeyStyle}" Tag="61" />
+                    <Button Grid.Column="15" Style="{StaticResource WhiteKeyStyle}" Tag="62" />
+                    <Button Grid.Column="17" Style="{StaticResource BlackKeyStyle}" Tag="63" />
+                    <Button Grid.Column="18" Style="{StaticResource WhiteKeyStyle}" Tag="64" />
+                    <Button Grid.Column="21" Style="{StaticResource WhiteKeyStyle}" Tag="65" />
+                    <Button Grid.Column="23" Style="{StaticResource BlackKeyStyle}" Tag="66" />
+                    <Button Grid.Column="24" Style="{StaticResource WhiteKeyStyle}" Tag="67" />
+                    <Button Grid.Column="26" Style="{StaticResource BlackKeyStyle}" Tag="68" />
+                    <Button Grid.Column="27" Style="{StaticResource WhiteKeyStyle}" Tag="69" />
+                    <Button Grid.Column="29" Style="{StaticResource BlackKeyStyle}" Tag="70" />
+                    <Button Grid.Column="30" Style="{StaticResource WhiteKeyStyle}" Tag="71" />
+                    <Button Grid.Column="33" Style="{StaticResource WhiteKeyStyle}" Tag="72" />
+                    <Button Grid.Column="35" Style="{StaticResource BlackKeyStyle}" Tag="73" />
+                    <Button Grid.Column="36" Style="{StaticResource WhiteKeyStyle}" Tag="74" />
+                    <Button Grid.Column="38" Style="{StaticResource BlackKeyStyle}" Tag="75" />
+                    <Button Grid.Column="39" Style="{StaticResource WhiteKeyStyle}" Tag="76" />
                 </Grid>
 
                 <StackPanel Grid.Row="1">
@@ -339,7 +348,7 @@
         </DockPanel>
 
         <!-- Connection list -->
-        <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <ScrollViewer PanningMode="VerticalOnly" VerticalScrollBarVisibility="Auto">
             <ItemsControl ItemsSource="{Binding Connections}">
                 <ItemsControl.ItemTemplate>
                     <DataTemplate>

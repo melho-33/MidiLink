@@ -230,7 +230,7 @@ namespace MidiLink
         {
             if (ThemeSelector.SelectedItem is ComboBoxItem item)
             {
-                string themeChoice = item.Tag?.ToString();
+                string? themeChoice = item.Tag?.ToString();
                 if (!string.IsNullOrEmpty(themeChoice))
                 {
                     ApplyTheme(themeChoice);
@@ -520,20 +520,171 @@ namespace MidiLink
             PianoPanel.Visibility = Visibility.Collapsed;
         }
 
-        private void PianoKey_Down(object sender, MouseButtonEventArgs e)
+        // --- fields for mouse / touch management ---
+        private bool _isMouseDown = false;
+        private Button? _currentMouseButton = null;                 // active button for mouse
+        private readonly Dictionary<int, Button> _touchActive = new(); // touchId -> active button
+
+        // --- UTILITY: find the Button under a point relative to PianoPanel ---
+        private Button? GetButtonAt(Point relativePoint)
         {
-            if (sender is Button btn && btn.Tag is string noteStr && int.TryParse(noteStr, out int note) && ToggleKeyboardPanel.IsChecked == true)
+            var hit = PianoPanel.InputHitTest(relativePoint) as DependencyObject;
+            while (hit != null && !(hit is Button))
             {
+                hit = VisualTreeHelper.GetParent(hit);
+            }
+            return hit as Button;
+        }
+
+        // --- UTILITY: activate / deactivate visual and send MIDI messages ---
+        private void PressButton(Button btn)
+        {
+            if (btn.Tag is string s && int.TryParse(s, out int note))
+            {
+                var bd = btn.Template?.FindName("Bd", btn) as Border;
+                var isBlack = IsBlackKeyFromNote(btn.Tag.ToString());
+                if (bd != null)
+                {
+                    bd.RenderTransform = new ScaleTransform(1.0, 0.95);
+                    bd.Background = isBlack ? new SolidColorBrush(Color.FromRgb(0x20, 0x20, 0x20))
+                                             : new SolidColorBrush(Color.FromRgb(0xd0, 0xd0, 0xd0));
+                }
+                // send note on
                 SendNoteOn(note);
             }
         }
 
-        private void PianoKey_Up(object sender, MouseButtonEventArgs e)
+        private void ReleaseButton(Button btn)
         {
-            if (sender is Button btn && btn.Tag is string noteStr && int.TryParse(noteStr, out int note) && ToggleKeyboardPanel.IsChecked == true)
+            if (btn.Tag is string s && int.TryParse(s, out int note))
             {
+                var bd = btn.Template?.FindName("Bd", btn) as Border;
+                var isBlack = IsBlackKeyFromNote(btn.Tag.ToString());
+                if (bd != null)
+                {
+                    bd.RenderTransform = new ScaleTransform(1.0, 1.0);
+                    bd.Background = isBlack ? new SolidColorBrush(Colors.Black)
+                                             : new SolidColorBrush(Colors.White);
+                }
+
+                // send note off
                 SendNoteOff(note);
             }
+        }
+        private bool IsBlackKeyFromNote(String? tag)
+        {
+            if (string.IsNullOrEmpty(tag))
+                return false;
+            if (!int.TryParse(tag, out int note)) return false;
+            int pc = note % 12;
+            return pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
+        }
+
+        // ---------------- Mouse handling ----------------
+        private void PianoPanel_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            _isMouseDown = true;
+            Mouse.Capture(PianoPanel); // capture mouse on panel
+            UpdateMouseKey(e.GetPosition(PianoPanel));
+            e.Handled = true;
+        }
+
+        private void PianoPanel_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (!_isMouseDown) return;
+            UpdateMouseKey(e.GetPosition(PianoPanel));
+        }
+
+        private void PianoPanel_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (_currentMouseButton != null)
+            {
+                ReleaseButton(_currentMouseButton);
+                _currentMouseButton = null;
+            }
+            _isMouseDown = false;
+            Mouse.Capture(null);
+            e.Handled = true;
+        }
+
+        private void UpdateMouseKey(Point pos)
+        {
+            var btn = GetButtonAt(pos);
+            if (btn == _currentMouseButton) return; // same key => nothing to do
+
+            // release previous key
+            if (_currentMouseButton != null)
+                ReleaseButton(_currentMouseButton);
+
+            // activate new key if present
+            if (btn != null)
+                PressButton(btn);
+
+            _currentMouseButton = btn;
+        }
+
+        // ---------------- Touch handling (multi-touch supported) ----------------
+        private void PianoPanel_TouchDown(object sender, TouchEventArgs e)
+        {
+            var touchId = e.TouchDevice.Id;
+            var pos = e.GetTouchPoint(PianoPanel).Position;
+            var btn = GetButtonAt(pos);
+            if (btn != null)
+            {
+                // associate this touch to this button and send note on
+                _touchActive[touchId] = btn;
+                PressButton(btn);
+
+                // capture the touch to follow its movement on the panel
+                PianoPanel.CaptureTouch(e.TouchDevice);
+            }
+            e.Handled = true;
+        }
+
+        private void PianoPanel_TouchMove(object sender, TouchEventArgs e)
+        {
+            var touchId = e.TouchDevice.Id;
+            var pos = e.GetTouchPoint(PianoPanel).Position;
+            var btn = GetButtonAt(pos);
+
+            // if we already have a key associated to this touchId
+            if (_touchActive.TryGetValue(touchId, out var previousBtn))
+            {
+                if (previousBtn != btn)
+                {
+                    // key changed: off previous, on new
+                    ReleaseButton(previousBtn);
+                    _touchActive.Remove(touchId);
+
+                    if (btn != null)
+                    {
+                        _touchActive[touchId] = btn;
+                        PressButton(btn);
+                    }
+                }
+            }
+            else
+            {
+                // no association yet, if we move over a button, activate it
+                if (btn != null)
+                {
+                    _touchActive[touchId] = btn;
+                    PressButton(btn);
+                }
+            }
+            e.Handled = true;
+        }
+
+        private void PianoPanel_TouchUp(object sender, TouchEventArgs e)
+        {
+            var touchId = e.TouchDevice.Id;
+            if (_touchActive.TryGetValue(touchId, out var btn))
+            {
+                ReleaseButton(btn);
+                _touchActive.Remove(touchId);
+            }
+            try { PianoPanel.ReleaseTouchCapture(e.TouchDevice); } catch { }
+            e.Handled = true;
         }
 
         private void SendNoteOn(int note, byte velocity = 100)
