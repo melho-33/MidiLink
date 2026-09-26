@@ -10,17 +10,13 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.IO;
 using System.Linq;
-using System.Text.Json;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
-using Windows.Devices.Enumeration;
 using Windows.Devices.Midi;
 
 namespace MidiLink
@@ -30,19 +26,19 @@ namespace MidiLink
     /// </summary>
     public partial class MainWindow : Window, INotifyPropertyChanged, IDisposable
     {
-        // Observable collections for MIDI input and output devices.
-        private readonly ObservableCollection<DeviceItem> _inDevices = new();
-        private readonly ObservableCollection<DeviceItem> _outDevices = new();
+        private readonly MidiPortManager _ports = new();
+        private readonly MidiDeviceService _devices;
+        private readonly ConfigService _config = new();
 
         /// <summary>
-        /// Read-only collection of available MIDI input devices.
+        /// Available MIDI input devices.
         /// </summary>
-        public ReadOnlyObservableCollection<DeviceItem> InDevices { get; }
+        public ObservableCollection<DeviceItem> InDevices => _devices.InDevices;
 
         /// <summary>
-        /// Read-only collection of available MIDI output devices.
+        /// Available MIDI output devices.
         /// </summary>
-        public ReadOnlyObservableCollection<DeviceItem> OutDevices { get; }
+        public ObservableCollection<DeviceItem> OutDevices => _devices.OutDevices;
 
         /// <summary>
         /// Collection of MIDI connection rows (links between input and output).
@@ -55,10 +51,19 @@ namespace MidiLink
         /// <summary>
         /// Global mute flag. If true, all MIDI routing is disabled.
         /// </summary>
-        public static bool GlobalMute { get; private set; } = false;
+        public bool GlobalMute { get; private set; }
 
+        // Virtual keyboard output (shared with connections through the port manager)
+        private OutPortLease? _keyboardLease;
+        private int _keyboardVersion;
 
-        private IMidiOutPort? _currentKeyboardOutPort;
+        // True while the config is being applied: avoids saving a half-loaded state
+        private bool _loading;
+        private bool _disposed;
+
+        // System tray
+        private readonly TrayIcon _trayIcon = new();
+        private bool _minimizeToTray;
 
         /// <summary>
         /// Status text property for UI binding.
@@ -69,55 +74,143 @@ namespace MidiLink
             set { _statusText = value; OnPropertyChanged(nameof(StatusText)); }
         }
 
-        // Path to the configuration file.
-        private readonly string _configPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MidiLink",
-            "config.json");
-        private void EnsureConfigDirectory()
-        {
-            var dir = Path.GetDirectoryName(_configPath);
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir!);
-        }
-
-        // JSON serializer options for config file.
-        private readonly JsonSerializerOptions _jsonOptions = new()
-        {
-            WriteIndented = true,
-            PropertyNameCaseInsensitive = true
-        };
-
-        // Timer for debounced config saving.
-        private Timer? _saveTimer;
-
         /// <summary>
         /// Initializes the main window and sets up event handlers.
         /// </summary>
         public MainWindow()
         {
+            _devices = new MidiDeviceService(Dispatcher);
+            _devices.IsInUse = IsDeviceInUse;
+            _devices.DeviceRemoved += id => _ports.Invalidate(id);
+            _devices.DevicesChanged += OnDevicesChanged;
+
+            // A port that stopped working (e.g. Bluetooth timeout) is dropped by the manager: reopen it
+            _ports.PortFailed += _ => Dispatcher.BeginInvoke(ReconnectAll);
+            // ...and when it answers again, the "not responding" warnings go away
+            _ports.DeviceRecovered += _ => Dispatcher.BeginInvoke(ReconnectAll);
+
+            // Links that failed to open (slow Bluetooth device, busy port...) are retried regularly
+            _retryTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
+            _retryTimer.Tick += (_, __) => RetryFailed();
+            _retryTimer.Start();
+
             InitializeComponent();
             DataContext = this;
+            AccentSelector.ItemsSource = AccentOption.All;
 
-            InDevices = new ReadOnlyObservableCollection<DeviceItem>(_inDevices);
-            OutDevices = new ReadOnlyObservableCollection<DeviceItem>(_outDevices);
-
-            Loaded += async (_, __) =>
+            _trayIcon.OpenRequested += RestoreFromTray;
+            _trayIcon.ExitRequested += Close;
+            StateChanged += (_, __) =>
             {
-                await RefreshDevicesAsync();
-                LoadConfigAndRestore();
-
-                if (OutDevices.Any())
-                {
-                    OutKeyboardCombo.SelectedValue = OutDevices.Last().Id;
-                }
-
-                // Reopen all connections after loading config
-                foreach (var c in Connections)
-                    _ = UpdateConnectionAsync(c);
+                if (WindowState == WindowState.Minimized && _minimizeToTray)
+                    Hide(); // the tray icon stays to bring it back
             };
 
-            Unloaded += (_, __) => Dispose();
+            // Launched at Windows startup: start minimized (in the tray if enabled)
+            bool startMinimized = StartupManager.IsStartupLaunch(Environment.GetCommandLineArgs());
+            if (startMinimized)
+                WindowState = WindowState.Minimized;
+
+            Loaded += (_, __) =>
+            {
+                try
+                {
+                    LoadConfigAndRestore();
+                    StartupManager.RefreshPathIfEnabled();
+                    _ = RefreshStartupSwitchAsync();
+                    if (startMinimized && _minimizeToTray)
+                        Hide();
+
+                    _devices.Start(); // connections open once the devices are enumerated
+                    StatusText = "Searching devices...";
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("Error during startup", ex);
+                    StatusText = $"Error during startup: {ex.Message}";
+                }
+            };
+
+            Closed += (_, __) => Dispose();
+        }
+
+        // ---------------- Settings ----------------
+
+        /// <summary>
+        /// Registers / unregisters the application to launch at Windows startup.
+        /// </summary>
+        private async void StartupSwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+            StartupNote.Visibility = Visibility.Collapsed;
+            try
+            {
+                var result = await StartupManager.SetEnabledAsync(StartupSwitch.IsOn);
+                if (result != StartupChangeResult.Done)
+                {
+                    StartupNote.Text = result == StartupChangeResult.DisabledByUser
+                        ? "Disabled in Windows. Enable MidiLink in Settings > Apps > Startup."
+                        : "Managed by your organization's policy.";
+                    StartupNote.Visibility = Visibility.Visible;
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("Cannot change startup setting", ex);
+                StartupNote.Text = $"Cannot change this setting: {ex.Message}";
+                StartupNote.Visibility = Visibility.Visible;
+            }
+            await RefreshStartupSwitchAsync(); // always show the real state
+        }
+
+        /// <summary>
+        /// Sets the startup switch from Windows' actual state (it can also be changed in Windows settings).
+        /// </summary>
+        private async Task RefreshStartupSwitchAsync()
+        {
+            try
+            {
+                bool enabled = await StartupManager.IsEnabledAsync();
+                _loading = true;
+                StartupSwitch.IsOn = enabled;
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("Cannot read startup setting", ex);
+            }
+            finally
+            {
+                _loading = false;
+            }
+        }
+
+        private void SettingsButton_Click(object sender, RoutedEventArgs e) => _ = RefreshStartupSwitchAsync();
+
+        /// <summary>
+        /// Enables / disables minimizing to the system tray.
+        /// </summary>
+        private void TraySwitch_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+            SetMinimizeToTray(TraySwitch.IsOn);
+            SaveConfig();
+        }
+
+        private void SetMinimizeToTray(bool enabled)
+        {
+            _minimizeToTray = enabled;
+            _trayIcon.Visible = enabled;
+        }
+
+        /// <summary>
+        /// Shows the window again (hidden in the tray, minimized, or behind other windows).
+        /// </summary>
+        public void RestoreFromTray()
+        {
+            Show();
+            if (WindowState == WindowState.Minimized)
+                WindowState = WindowState.Normal;
+            Activate();
         }
 
         // ---------------- UI Event Handlers ----------------
@@ -132,7 +225,9 @@ namespace MidiLink
                 IsInactive = true // New connections are disabled by default
             };
             row.PropertyChanged += Connection_PropertyChanged;
+            row.Filter.Changed += SaveConfig;
             Connections.Add(row);
+            UpdateConnection(row);
             SaveConfig();
             UpdateStatusCounts();
         }
@@ -144,26 +239,30 @@ namespace MidiLink
         {
             if ((sender as FrameworkElement)?.DataContext is ConnectionRow row)
             {
-                row.Dispose();
                 row.PropertyChanged -= Connection_PropertyChanged;
+                row.Filter.Changed -= SaveConfig;
+                row.Dispose(); // gives the ports back; released in the background, the UI never waits
                 Connections.Remove(row);
+                _devices.PruneUnused();
                 SaveConfig();
                 UpdateStatusCounts();
             }
         }
 
         /// <summary>
-        /// Refreshes the list of MIDI devices and updates connections.
+        /// Rescans the MIDI devices and retries the connections that are not working.
         /// </summary>
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
         {
-            await RefreshDevicesAsync();
-            EnsurePlaceholdersForMissingSelections();
-
-            foreach (var c in Connections)
-                _ = UpdateConnectionAsync(c);
-
-            UpdateStatusCounts();
+            try
+            {
+                await _devices.RescanAsync(); // raises DevicesChanged, which updates the connections
+            }
+            catch (Exception ex)
+            {
+                AppLog.Error("Error refreshing devices", ex);
+                StatusText = $"Error refreshing devices: {ex.Message}";
+            }
         }
 
         /// <summary>
@@ -176,29 +275,78 @@ namespace MidiLink
             // Update button text according to mute state
             DisableAllButton.Content = GlobalMute ? "Enable all" : "Disable all";
 
-            // Force all connections to re-evaluate (close or open as appropriate)
-            foreach (var c in Connections)
-                _ = UpdateConnectionAsync(c);
-
-            UpdateStatusCounts();
+            UpdateAllConnections();
         }
-
 
         /// <summary>
         /// Handles property changes in connection rows.
         /// </summary>
         private void Connection_PropertyChanged(object? sender, PropertyChangedEventArgs e)
         {
-            if (sender is ConnectionRow row &&
-                (e.PropertyName is nameof(ConnectionRow.InId) ||
-                 e.PropertyName is nameof(ConnectionRow.OutId) ||
-                 e.PropertyName is nameof(ConnectionRow.IsInactive)))
+            if (sender is not ConnectionRow row) return;
+
+            switch (e.PropertyName)
             {
-                _ = UpdateConnectionAsync(row);
-                SaveConfig();
-                UpdateStatusCounts();
+                case nameof(ConnectionRow.InId):
+                case nameof(ConnectionRow.OutId):
+                    _devices.PruneUnused(); // the previous device may no longer be needed in the list
+                    goto case nameof(ConnectionRow.IsInactive);
+
+                case nameof(ConnectionRow.IsInactive):
+                    UpdateConnection(row);
+                    SaveConfig();
+                    break;
+
+                case nameof(ConnectionRow.State):
+                    UpdateStatusCounts();
+                    break;
             }
         }
+
+        // ---------------- Filters ----------------
+
+        /// <summary>
+        /// Opens the Filters flyout of a link.
+        /// </summary>
+        private void Filters_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not FrameworkElement button || button.DataContext is not ConnectionRow row) return;
+
+            // x:Shared="False": each call gives a fresh flyout, bound to this link's filters
+            var flyout = (ModernWpf.Controls.Flyout)FindResource("FiltersFlyout");
+            if (flyout.Content is FrameworkElement content)
+                content.DataContext = row.Filter;
+            flyout.ShowAt(button);
+        }
+
+        private static MidiFilterSettings? FilterOf(object sender) =>
+            (sender as FrameworkElement)?.DataContext as MidiFilterSettings;
+
+        /// <summary>
+        /// Transpose buttons: Tag is the step in semitones, "0" resets.
+        /// </summary>
+        private void TransposeButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (FilterOf(sender) is not MidiFilterSettings filter) return;
+            if (sender is FrameworkElement { Tag: string tag } && int.TryParse(tag, out int step))
+                filter.Transpose = step == 0 ? 0 : filter.Transpose + step;
+        }
+
+        private void AllChannels_Click(object sender, RoutedEventArgs e) => FilterOf(sender)?.SetAllChannels(true);
+
+        private void NoChannels_Click(object sender, RoutedEventArgs e) => FilterOf(sender)?.SetAllChannels(false);
+
+        private void AddCcRemap_Click(object sender, RoutedEventArgs e) =>
+            FilterOf(sender)?.CcRemaps.Add(new CcRemap { From = 1, To = 74 }); // mod wheel -> cutoff, a common one
+
+        private void RemoveCcRemap_Click(object sender, RoutedEventArgs e)
+        {
+            // DataContext is the rule; Tag is bound to the filter owning the list
+            if (sender is FrameworkElement { DataContext: CcRemap remap, Tag: MidiFilterSettings filter })
+                filter.CcRemaps.Remove(remap);
+        }
+
+        private void ResetFilters_Click(object sender, RoutedEventArgs e) => FilterOf(sender)?.Reset();
 
         // ---------------- Theme Management ----------------
 
@@ -239,133 +387,136 @@ namespace MidiLink
             }
         }
 
-        // ---------------- Device Scan & Helpers ----------------
+        /// <summary>
+        /// Handles accent color selection from the swatches.
+        /// </summary>
+        private void AccentSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (AccentSelector.SelectedItem is AccentOption option)
+            {
+                ApplyAccent(option);
+                SaveConfig();
+            }
+        }
+
+        // "#RRGGBB", or "" for the Windows accent color
+        private string _accentColor = "";
+
+        private void ApplyAccent(AccentOption option)
+        {
+            _accentColor = option.Hex ?? "";
+            ThemeManager.Current.AccentColor = option.Color; // null = follow Windows
+        }
+
+        // ---------------- Devices & MIDI Routing ----------------
 
         /// <summary>
-        /// Refreshes the list of MIDI input and output devices.
+        /// True if a device is selected by a connection or by the keyboard.
         /// </summary>
-        private async Task RefreshDevicesAsync()
+        private bool IsDeviceInUse(string id) =>
+            Connections.Any(c => c.InId == id || c.OutId == id) ||
+            Equals(OutKeyboardCombo?.SelectedValue, id);
+
+        /// <summary>
+        /// Called after the initial enumeration and on every plug / unplug / refresh.
+        /// </summary>
+        private void OnDevicesChanged()
         {
-            // Save previous selections to restore after refresh
-            var previousSelections = Connections
-                .Select(c => new { Conn = c, c.InId, c.OutId })
-                .ToList();
+            RemapMovedDevices();
+            UpdateAllConnections();
 
-            _inDevices.Clear();
-            _outDevices.Clear();
-
-            // Scan for MIDI input and output devices
-            var inInfos = await DeviceInformation.FindAllAsync(MidiInPort.GetDeviceSelector());
-            var outInfos = await DeviceInformation.FindAllAsync(MidiOutPort.GetDeviceSelector());
-
-            foreach (var di in inInfos)
-                _inDevices.Add(DeviceItem.FromDeviceInfo(di));
-
-            // Map input device names by short ID for better output naming
-            var inNameByShortId = _inDevices
-                .Where(d => !string.IsNullOrEmpty(d.ShortId))
-                .GroupBy(d => d.ShortId)
-                .ToDictionary(g => g.Key, g => g.First().Name);
-
-            foreach (var di in outInfos)
+            // Default keyboard output: first connected device of the list
+            if (OutKeyboardCombo.SelectedValue == null)
             {
-                var dev = DeviceItem.FromDeviceInfo(di);
-                if (dev.Name.Equals("MIDI", StringComparison.OrdinalIgnoreCase) &&
-                    !string.IsNullOrEmpty(dev.ShortId) &&
-                    inNameByShortId.TryGetValue(dev.ShortId, out var betterName))
-                {
-                    dev.Name = betterName;
-                }
-                _outDevices.Add(dev);
+                var first = OutDevices.FirstOrDefault(d => d.IsAvailable);
+                if (first != null)
+                    OutKeyboardCombo.SelectedValue = first.Id;
             }
+            _ = EnsureKeyboardPortAsync();
 
-            // Restore previous selections if still available
-            foreach (var prev in previousSelections)
-            {
-                if (!string.IsNullOrEmpty(prev.InId) &&
-                    _inDevices.Any(d => d.Id == prev.InId))
-                    prev.Conn.InId = prev.InId;
-
-                if (!string.IsNullOrEmpty(prev.OutId) &&
-                    _outDevices.Any(d => d.Id == prev.OutId))
-                    prev.Conn.OutId = prev.OutId;
-            }
-
-            // Restore keyboard output selection if still available
-            if (_currentKeyboardOutPort != null)
-            {
-                try
-                {
-                    string currentId = _currentKeyboardOutPort.DeviceId;
-                    if (_outDevices.Any(d => d.Id == currentId))
-                        OutKeyboardCombo.SelectedValue = currentId;
-                }
-                catch
-                {
-                    // DeviceId may not be available -> ignore
-                }
-            }
-
-            StatusText = $"Devices: {InDevices.Count} IN, {OutDevices.Count} OUT" + (GlobalMute ? " (all disabled)" : "");
+            SaveConfig(); // records device names, used to find a device again if its ID changes
         }
 
         /// <summary>
-        /// Adds placeholder devices for missing selections in the UI.
+        /// A device plugged into another USB port gets a new ID: if a saved device is missing
+        /// and exactly one connected device has the same name, use that one instead.
         /// </summary>
-        private void EnsurePlaceholdersForMissingSelections()
+        private void RemapMovedDevices()
+        {
+            foreach (var row in Connections)
+            {
+                var newIn = FindByName(row.InId, isOut: false);
+                if (newIn != null) row.InId = newIn;
+
+                var newOut = FindByName(row.OutId, isOut: true);
+                if (newOut != null) row.OutId = newOut;
+            }
+        }
+
+        private string? FindByName(string? id, bool isOut)
+        {
+            var missing = _devices.Find(id, isOut);
+            if (missing == null || missing.IsAvailable) return null;
+
+            var candidates = (isOut ? OutDevices : InDevices)
+                .Where(d => d.IsAvailable && d.Name == missing.Name)
+                .ToList();
+            if (candidates.Count != 1) return null;
+
+            AppLog.Info($"Device '{missing.Name}' found under a new ID: {candidates[0].Id}");
+            return candidates[0].Id;
+        }
+
+        /// <summary>
+        /// Opens or closes a connection according to its settings (no-op before devices are known).
+        /// </summary>
+        private void UpdateConnection(ConnectionRow row)
+        {
+            if (!_devices.IsEnumerated || _disposed) return;
+            _ = row.UpdateAsync(_ports, _devices, GlobalMute);
+        }
+
+        private readonly DispatcherTimer _retryTimer;
+
+        /// <summary>
+        /// After a port failure: every link / the keyboard using a dead port reopens it.
+        /// </summary>
+        private void ReconnectAll()
+        {
+            if (_disposed) return;
+            UpdateAllConnections();
+            _ = EnsureKeyboardPortAsync();
+            UpdateKeyboardWarning();
+        }
+
+        /// <summary>
+        /// Orange icon next to the keyboard output when that device does not answer.
+        /// </summary>
+        private void UpdateKeyboardWarning()
+        {
+            var id = OutKeyboardCombo.SelectedValue as string;
+            bool show = PianoPanel.Visibility == Visibility.Visible
+                        && _devices.IsAvailable(id, isOut: true)
+                        && !_ports.IsResponding(id);
+            KeyboardWarning.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        /// <summary>
+        /// Retries the links in error and the keyboard output (no-op for what already works).
+        /// </summary>
+        private void RetryFailed()
+        {
+            if (_disposed || !_devices.IsEnumerated) return;
+            foreach (var row in Connections.Where(c => c.State == ConnectionState.Error))
+                UpdateConnection(row);
+            _ = EnsureKeyboardPortAsync();
+        }
+
+        private void UpdateAllConnections()
         {
             foreach (var c in Connections)
-            {
-                if (!string.IsNullOrWhiteSpace(c.InId) && !_inDevices.Any(d => d.Id == c.InId))
-                    _inDevices.Add(DeviceItem.Placeholder(c.InId!, isOut: false));
-
-                if (!string.IsNullOrWhiteSpace(c.OutId) && !_outDevices.Any(d => d.Id == c.OutId))
-                    _outDevices.Add(DeviceItem.Placeholder(c.OutId!, isOut: true));
-            }
-        }
-
-        // ---------------- MIDI Routing ----------------
-
-        /// <summary>
-        /// Opens or closes MIDI connections based on current state and global mute.
-        /// </summary>
-        private async Task UpdateConnectionAsync(ConnectionRow row)
-        {
-            try
-            {
-                // Close connection if muted, inactive, or missing device IDs
-                if (GlobalMute || row.IsInactive || string.IsNullOrWhiteSpace(row.InId) || string.IsNullOrWhiteSpace(row.OutId))
-                {
-                    row.Close();
-                    return;
-                }
-
-                // If already active and no need to reopen, skip
-                if (row.IsActive && !row.NeedsReopen)
-                    return;
-
-                // If needs reopen, close first
-                if (row.NeedsReopen)
-                {
-                    row.Close();
-                    row.NeedsReopen = false;
-                }
-
-                if (row.IsActive) return;
-
-                // Try to open MIDI ports
-                var inPort = await MidiInPort.FromIdAsync(row.InId!);
-                var outPort = await MidiOutPort.FromIdAsync(row.OutId!);
-
-                if (inPort == null || outPort == null)
-                    return;
-
-                row.Open(inPort, outPort);
-            }
-            catch (Exception ex)
-            {
-                StatusText = $"Error opening: {ex.Message}";
-            }
+                UpdateConnection(c);
+            UpdateStatusCounts();
         }
 
         // ---------------- Configuration ----------------
@@ -375,21 +526,24 @@ namespace MidiLink
         /// </summary>
         private void LoadConfigAndRestore()
         {
+            _loading = true;
             try
             {
-                AppConfig cfg = new();
-
-                if (File.Exists(_configPath))
-                {
-                    var json = File.ReadAllText(_configPath);
-                    cfg = JsonSerializer.Deserialize<AppConfig>(json, _jsonOptions) ?? new AppConfig();
-                }
+                AppConfig cfg = _config.Load();
 
                 // If theme is missing, default to System
                 if (string.IsNullOrEmpty(cfg.Theme))
                     cfg.Theme = "System";
 
                 ApplyTheme(cfg.Theme);
+
+                // Other settings
+                var accent = AccentOption.FromHex(cfg.AccentColor);
+                ApplyAccent(accent);
+                AccentSelector.SelectedItem = accent;
+
+                SetMinimizeToTray(cfg.MinimizeToTray);
+                TraySwitch.IsOn = cfg.MinimizeToTray;
 
                 // Sync ComboBox selection with loaded theme
                 foreach (var item in ThemeSelector.Items)
@@ -401,61 +555,59 @@ namespace MidiLink
                     }
                 }
 
-                // Load MIDI connections from config
+                // Load MIDI connections from config. Devices are shown as "not connected"
+                // until the device watcher finds them.
                 Connections.Clear();
                 foreach (var c in cfg.Connections)
                 {
+                    _devices.EnsurePlaceholder(c.InId, c.InName, isOut: false);
+                    _devices.EnsurePlaceholder(c.OutId, c.OutName, isOut: true);
+
                     var row = new ConnectionRow
                     {
-                        InId = c.InId,
-                        OutId = c.OutId,
+                        InId = string.IsNullOrWhiteSpace(c.InId) ? null : c.InId,
+                        OutId = string.IsNullOrWhiteSpace(c.OutId) ? null : c.OutId,
                         IsInactive = c.Inactive
                     };
+                    if (c.Filter != null)
+                        row.Filter.Load(c.Filter);
                     row.PropertyChanged += Connection_PropertyChanged;
+                    row.Filter.Changed += SaveConfig;
                     Connections.Add(row);
                 }
 
-                EnsurePlaceholdersForMissingSelections();
                 UpdateStatusCounts();
             }
-            catch (Exception ex)
+            finally
             {
-                StatusText = $"Error loading config: {ex.Message}";
+                _loading = false;
             }
         }
 
         /// <summary>
-        /// Saves configuration to file (debounced).
+        /// Saves configuration (snapshot taken here on the UI thread, written in the background).
         /// </summary>
         private void SaveConfig()
         {
-            // Debounce save for 500ms
-            _saveTimer?.Dispose();
-            _saveTimer = new Timer(_ =>
-            {
-                try
-                {
-                    var cfg = new AppConfig
-                    {
-                        Connections = Connections.Select(c => new MidiConnectionConfig
-                        {
-                            InId = c.InId ?? string.Empty,
-                            OutId = c.OutId ?? string.Empty,
-                            Inactive = c.IsInactive
-                        }).ToList(),
-                        Theme = CurrentTheme
-                    };
+            if (_loading || _disposed) return;
 
-                    var json = JsonSerializer.Serialize(cfg, _jsonOptions);
-                    EnsureConfigDirectory();
-                    File.WriteAllText(_configPath, json);
-                }
-                catch (Exception ex)
+            _config.Save(new AppConfig
+            {
+                Connections = Connections.Select(c => new MidiConnectionConfig
                 {
-                    StatusText = $"Error saving config: {ex.Message}";
-                }
-            }, null, 500, Timeout.Infinite);
+                    InId = c.InId ?? string.Empty,
+                    OutId = c.OutId ?? string.Empty,
+                    InName = _devices.Find(c.InId, isOut: false)?.Name ?? string.Empty,
+                    OutName = _devices.Find(c.OutId, isOut: true)?.Name ?? string.Empty,
+                    Inactive = c.IsInactive,
+                    Filter = c.Filter.ToConfig()
+                }).ToList(),
+                Theme = CurrentTheme,
+                MinimizeToTray = _minimizeToTray,
+                AccentColor = _accentColor
+            });
         }
+
         private string CurrentTheme = "System";
 
         /// <summary>
@@ -486,10 +638,8 @@ namespace MidiLink
         /// </summary>
         private void UpdateStatusCounts()
         {
-            int total = Connections.Count;
-            int inactive = Connections.Count(c => c.IsInactive);
             int active = Connections.Count(c => c.IsActive);
-            StatusText = $"Links: {total}" + (GlobalMute ? " (all disabled)" : "");
+            StatusText = $"Links: {Connections.Count}, connected: {active}" + (GlobalMute ? " (all disabled)" : "");
         }
 
         /// <summary>
@@ -499,25 +649,36 @@ namespace MidiLink
         private void OnPropertyChanged(string prop) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));
 
         /// <summary>
-        /// Disposes all connections and timers.
+        /// Stops device watching, closes every port and writes pending config.
         /// </summary>
         public void Dispose()
         {
+            if (_disposed) return;
+            _disposed = true;
+            _retryTimer.Stop();
+
+            _devices.Dispose();
             foreach (var c in Connections)
                 c.Dispose();
-            _saveTimer?.Dispose();
+            _keyboardLease?.Dispose();
+            _keyboardLease = null;
+            _ports.Dispose(); // synchronous on shutdown
+            _config.Dispose();
+            _trayIcon.Dispose();
         }
 
         private void ToggleKeyboardPanel_Checked(object sender, RoutedEventArgs e)
         {
             OutKeyboardCombo.Visibility = Visibility.Visible;
             PianoPanel.Visibility = Visibility.Visible;
+            UpdateKeyboardWarning();
         }
 
         private void ToggleKeyboardPanel_Unchecked(object sender, RoutedEventArgs e)
         {
             OutKeyboardCombo.Visibility = Visibility.Hidden;
             PianoPanel.Visibility = Visibility.Collapsed;
+            UpdateKeyboardWarning();
         }
 
         // --- fields for mouse / touch management ---
@@ -689,323 +850,71 @@ namespace MidiLink
 
         private void SendNoteOn(int note, byte velocity = 100)
         {
-            if (_currentKeyboardOutPort != null)
-            {
-                var noteOn = new MidiNoteOnMessage(0, (byte)note, velocity); // channel 0
-                _currentKeyboardOutPort.SendMessage(noteOn);
-            }
+            SendKeyboardMessage(new MidiNoteOnMessage(0, (byte)note, velocity)); // channel 0
         }
 
         private void SendNoteOff(int note)
         {
-            if (_currentKeyboardOutPort != null)
-            {
-                var noteOff = new MidiNoteOffMessage(0, (byte)note, 0);
-                _currentKeyboardOutPort.SendMessage(noteOff);
-            }
+            SendKeyboardMessage(new MidiNoteOffMessage(0, (byte)note, 0));
         }
 
-        private async void OutKeyboardCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (OutKeyboardCombo.SelectedValue is string outId && !string.IsNullOrWhiteSpace(outId))
-            {
-                _currentKeyboardOutPort?.Dispose();
-                _currentKeyboardOutPort = null;
-
-                try
-                {
-                    _currentKeyboardOutPort = await MidiOutPort.FromIdAsync(outId);
-                }
-                catch (Exception ex)
-                {
-                    StatusText = $"Error opening output: {ex.Message}";
-                }
-            }
-        }
-
-    }
-
-    /// <summary>
-    /// Represents a MIDI device (input or output) or a placeholder for missing devices.
-    /// </summary>
-    public class DeviceItem
-    {
-        /// <summary>
-        /// Device identifier string.
-        /// </summary>
-        public string Id { get; set; } = "";
-        /// <summary>
-        /// Device display name.
-        /// </summary>
-        public string Name { get; set; } = "";
-        /// <summary>
-        /// Short identifier extracted from device ID.
-        /// </summary>
-        public string ShortId { get; set; } = "";
-        /// <summary>
-        /// Display string for UI (includes short ID if available).
-        /// </summary>
-        public string Display => string.IsNullOrEmpty(ShortId) ? Name : $"{Name} [{ShortId}]";
-        /// <summary>
-        /// True if this is a placeholder device.
-        /// </summary>
-        public bool IsPlaceholder { get; set; }
-
-        /// <summary>
-        /// Creates a DeviceItem from a DeviceInformation object.
-        /// </summary>
-        public static DeviceItem FromDeviceInfo(DeviceInformation di) =>
-            new()
-            {
-                Id = di.Id,
-                Name = di.Name,
-                ShortId = ExtractShortId(di.Id) ?? "",
-                IsPlaceholder = false
-            };
-
-        /// <summary>
-        /// Creates a placeholder DeviceItem for missing devices.
-        /// </summary>
-        public static DeviceItem Placeholder(string fullId, bool isOut) =>
-            new()
-            {
-                Id = fullId,
-                Name = isOut ? "NOT FOUND" : "NOT FOUND",
-                ShortId = ExtractShortId(fullId) ?? "",
-                IsPlaceholder = true
-            };
-
-        /// <summary>
-        /// Extracts a short ID from a full device ID string.
-        /// </summary>
-        public static string? ExtractShortId(string fullId)
-        {
-            if (string.IsNullOrEmpty(fullId)) return null;
-            int idx = fullId.IndexOf("MIDI", StringComparison.OrdinalIgnoreCase);
-            if (idx >= 0)
-            {
-                int underscore = fullId.IndexOf('_', idx);
-                if (underscore >= 0)
-                {
-                    int dot = fullId.IndexOf('.', underscore);
-                    if (dot > underscore)
-                        return fullId.Substring(underscore + 1, dot - underscore - 1);
-                }
-            }
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Represents a MIDI connection row (link between input and output devices).
-    /// </summary>
-    public class ConnectionRow : INotifyPropertyChanged, IDisposable
-    {
-        private string? _inId;
-        private string? _outId;
-        private bool _inactive;
-        private MidiInPort? _inPort;
-        private IMidiOutPort? _outPort;
-
-        private SolidColorBrush _arrowBrush = new SolidColorBrush(Colors.Gray);
-        public SolidColorBrush ArrowBrush
-        {
-            get => _arrowBrush;
-            set
-            {
-                _arrowBrush = value;
-                OnPropertyChanged(nameof(ArrowBrush));
-            }
-        }
-        /// <summary>
-        /// Indicates if the connection needs to be reopened.
-        /// </summary>
-        public bool NeedsReopen { get; set; }
-
-        /// <summary>
-        /// MIDI input device ID.
-        /// </summary>
-        public string? InId
-        {
-            get => _inId;
-            set
-            {
-                if (_inId != value)
-                {
-                    _inId = value;
-                    NeedsReopen = true;
-                    OnPropertyChanged(nameof(InId));
-                    OnPropertyChanged(nameof(IsActive));
-                }
-            }
-        }
-
-        /// <summary>
-        /// MIDI output device ID.
-        /// </summary>
-        public string? OutId
-        {
-            get => _outId;
-            set
-            {
-                if (_outId != value)
-                {
-                    _outId = value;
-                    NeedsReopen = true;
-                    OnPropertyChanged(nameof(OutId));
-                    OnPropertyChanged(nameof(IsActive));
-                }
-            }
-        }
-
-        /// <summary>
-        /// True if the connection is inactive (disabled).
-        /// </summary>
-        public bool IsInactive
-        {
-            get => _inactive;
-            set
-            {
-                if (_inactive != value)
-                {
-                    _inactive = value;
-                    OnPropertyChanged(nameof(IsInactive));
-                    OnPropertyChanged(nameof(ActiveLabel));
-                    OnPropertyChanged(nameof(IsActive));
-                }
-            }
-        }
-
-        /// <summary>
-        /// Label for the enable/disable button in the UI.
-        /// </summary>
-        public string ActiveLabel => IsInactive ? "Enable" : "Disable";
-        /// <summary>
-        /// True if the connection is active (not inactive and both ports are open).
-        /// </summary>
-        public bool IsActive => !IsInactive && _inPort != null && _outPort != null;
-
-        /// <summary>
-        /// Opens the MIDI connection (subscribes to input events).
-        /// </summary>
-        public void Open(MidiInPort inPort, IMidiOutPort outPort)
-        {
-            Close();
-            _inPort = inPort;
-            _outPort = outPort;
-            _inPort.MessageReceived += InPort_MessageReceived;
-            OnPropertyChanged(nameof(IsActive));
-        }
-
-        /// <summary>
-        /// Handles incoming MIDI messages and routes them to the output port.
-        /// </summary>
-
-        private DispatcherTimer? _flashTimer;
-
-        private void InPort_MessageReceived(MidiInPort sender, MidiMessageReceivedEventArgs args)
+        private void SendKeyboardMessage(IMidiMessage message)
         {
             try
             {
-                if (!IsInactive && _outPort != null)
-                    _outPort.SendMessage(args.Message);
-
-                Application.Current.Dispatcher.Invoke(() =>
-                {
-                    ArrowBrush.Color = Colors.Orange;
-
-                    if (_flashTimer == null)
-                    {
-                        _flashTimer = new DispatcherTimer
-                        {
-                            Interval = TimeSpan.FromMilliseconds(500)
-                        };
-                        _flashTimer.Tick += (s, e) =>
-                        {
-                            ArrowBrush.Color = Colors.Gray;
-                            _flashTimer.Stop();
-                        };
-                    }
-
-                    // 🔄 Redémarrer le timer à chaque nouveau message
-                    _flashTimer.Stop();
-                    _flashTimer.Start();
-                });
+                _keyboardLease?.Send(message);
             }
             catch (Exception ex)
             {
-                // Update status text in case of MIDI send error
-                Application.Current.Dispatcher.Invoke(() =>
-                {
-                    if (Application.Current.MainWindow is MainWindow mw)
-                        mw.StatusText = $"Error sending MIDI: {ex.Message}";
-                });
+                // Device unplugged or not responding: never crash while playing
+                AppLog.Error("Error sending keyboard MIDI", ex);
+                StatusText = $"Keyboard output unavailable: {ex.Message}";
             }
         }
 
-        /// <summary>
-        /// Closes the MIDI connection and disposes ports.
-        /// </summary>
-        public void Close()
+        private void OutKeyboardCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (_inPort != null)
-            {
-                try { _inPort.MessageReceived -= InPort_MessageReceived; } catch (Exception ex) { Application.Current.Dispatcher.Invoke(() => { if (Application.Current.MainWindow is MainWindow mw) mw.StatusText = $"Error detaching MIDI event: {ex.Message}"; }); }
-                try { _inPort.Dispose(); } catch (Exception ex) { Application.Current.Dispatcher.Invoke(() => { if (Application.Current.MainWindow is MainWindow mw) mw.StatusText = $"Error disposing MIDI IN: {ex.Message}"; }); }
-                _inPort = null;
-            }
-            if (_outPort != null)
-            {
-                try { _outPort.Dispose(); } catch (Exception ex) { Application.Current.Dispatcher.Invoke(() => { if (Application.Current.MainWindow is MainWindow mw) mw.StatusText = $"Error disposing MIDI OUT: {ex.Message}"; }); }
-                _outPort = null;
-            }
-            OnPropertyChanged(nameof(IsActive));
+            _devices.PruneUnused();
+            _ = EnsureKeyboardPortAsync();
+            UpdateKeyboardWarning();
         }
 
         /// <summary>
-        /// Disposes the connection row.
+        /// Makes sure the keyboard holds a live lease on the selected output (reopens after a replug).
         /// </summary>
-        public void Dispose() => Close();
+        private async System.Threading.Tasks.Task EnsureKeyboardPortAsync()
+        {
+            if (_disposed) return;
 
-        /// <summary>
-        /// PropertyChanged event for INotifyPropertyChanged.
-        /// </summary>
-        public event PropertyChangedEventHandler? PropertyChanged;
-        private void OnPropertyChanged(string prop) =>
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));
-    }
+            var outId = OutKeyboardCombo.SelectedValue as string;
+            if (_keyboardLease is { IsAlive: true } && _keyboardLease.DeviceId == outId)
+                return;
 
-    /// <summary>
-    /// Application configuration (connections and theme).
-    /// </summary>
-    public class AppConfig
-    {
-        /// <summary>
-        /// List of MIDI connection configurations.
-        /// </summary>
-        public List<MidiConnectionConfig> Connections { get; set; } = new();
-        /// <summary>
-        /// Selected theme ("Light", "Dark", "System").
-        /// </summary>
-        public string Theme { get; set; } = "System";
-    }
+            int version = ++_keyboardVersion;
+            _keyboardLease?.Dispose();
+            _keyboardLease = null;
 
-    /// <summary>
-    /// Configuration for a MIDI connection (for persistence).
-    /// </summary>
-    public class MidiConnectionConfig
-    {
-        /// <summary>
-        /// MIDI input device ID.
-        /// </summary>
-        public string InId { get; set; } = "";
-        /// <summary>
-        /// MIDI output device ID.
-        /// </summary>
-        public string OutId { get; set; } = "";
-        /// <summary>
-        /// True if the connection is inactive (disabled).
-        /// </summary>
-        public bool Inactive { get; set; }
+            if (string.IsNullOrWhiteSpace(outId) || !_devices.IsAvailable(outId, isOut: true))
+                return;
+
+            try
+            {
+                var lease = await _ports.AcquireOutAsync(outId);
+
+                // Selection changed while the port was opening
+                if (version != _keyboardVersion || _disposed)
+                {
+                    lease.Dispose();
+                    return;
+                }
+                _keyboardLease = lease;
+            }
+            catch (Exception ex)
+            {
+                if (version == _keyboardVersion)
+                    StatusText = $"Error opening keyboard output: {ex.Message}";
+            }
+        }
+
     }
 }

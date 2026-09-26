@@ -10,14 +10,261 @@
         Title="MIDILINK" Height="500" Width="600"
         xmlns:ui="http://schemas.modernwpf.com/2019"
         ui:WindowHelper.UseModernWindowStyle="True"
-        xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes">
+        xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes"
+        xmlns:local="clr-namespace:MidiLink">
 
     <Window.Resources>
-        <!-- Add global resources here if needed -->
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+
+        <!-- Filters flyout: section titles, labels, secondary values -->
+        <Style x:Key="FilterSectionHeader" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundAccentBrush}"/>
+            <Setter Property="Margin" Value="0,20,0,8"/>
+        </Style>
+        <Style x:Key="FilterLabel" TargetType="TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Margin" Value="0,0,8,0"/>
+        </Style>
+        <Style x:Key="FilterValue" TargetType="TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+        </Style>
+
+        <!-- One flyout per opening (x:Shared=False); its DataContext is the link's MidiFilterSettings -->
+        <ui:Flyout x:Key="FiltersFlyout" x:Shared="False" Placement="Left">
+            <ScrollViewer MaxHeight="560" VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly" Padding="0,0,14,0">
+                <StackPanel Width="330">
+
+                    <!-- Title -->
+                    <Grid>
+                        <TextBlock Text="Filters" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <Button HorizontalAlignment="Right" Padding="10,4" Click="ResetFilters_Click"
+                                ToolTip="Remove every filter of this link">
+                            <StackPanel Orientation="Horizontal">
+                                <materialDesign:PackIcon Kind="Restore" Width="16" Height="16" VerticalAlignment="Center"/>
+                                <TextBlock Text="Reset" Margin="6,0,0,0"/>
+                            </StackPanel>
+                        </Button>
+                    </Grid>
+                    <TextBlock Text="Changes apply immediately." Style="{StaticResource FilterValue}" Margin="0,2,0,0"/>
+
+                    <!-- ===== NOTES ===== -->
+                    <TextBlock Text="NOTES" Style="{StaticResource FilterSectionHeader}"/>
+
+                    <Grid>
+                        <TextBlock Text="Transpose" Style="{StaticResource FilterLabel}"/>
+                        <TextBlock Text="{Binding TransposeText}" Style="{StaticResource FilterValue}" HorizontalAlignment="Right"/>
+                    </Grid>
+                    <UniformGrid Columns="5" Margin="-2,6,-2,0">
+                        <Button Content="−Oct" Tag="-12" Click="TransposeButton_Click" Margin="2" Height="34" HorizontalAlignment="Stretch" ToolTip="One octave down"/>
+                        <Button Content="−1" Tag="-1" Click="TransposeButton_Click" Margin="2" Height="34" HorizontalAlignment="Stretch" ToolTip="One semitone down"/>
+                        <Button Content="0" Tag="0" Click="TransposeButton_Click" Margin="2" Height="34" HorizontalAlignment="Stretch" ToolTip="No transposition"/>
+                        <Button Content="+1" Tag="1" Click="TransposeButton_Click" Margin="2" Height="34" HorizontalAlignment="Stretch" ToolTip="One semitone up"/>
+                        <Button Content="+Oct" Tag="12" Click="TransposeButton_Click" Margin="2" Height="34" HorizontalAlignment="Stretch" ToolTip="One octave up"/>
+                    </UniformGrid>
+
+                    <ui:ToggleSwitch IsOn="{Binding NoteRangeEnabled, Mode=TwoWay}" Margin="0,12,0,0"
+                                     OnContent="Limit note range" OffContent="Limit note range"/>
+                    <Grid Visibility="{Binding NoteRangeEnabled, Converter={StaticResource BoolToVis}}" Margin="0,4,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="72"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="Lowest" Style="{StaticResource FilterLabel}"/>
+                        <Slider Grid.Column="1" Minimum="0" Maximum="127" IsSnapToTickEnabled="True" TickFrequency="1"
+                                Value="{Binding NoteMin, Mode=TwoWay}" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="2" Text="{Binding NoteMinText}" Style="{StaticResource FilterValue}" HorizontalAlignment="Right"/>
+                        <TextBlock Grid.Row="1" Text="Highest" Style="{StaticResource FilterLabel}"/>
+                        <Slider Grid.Row="1" Grid.Column="1" Minimum="0" Maximum="127" IsSnapToTickEnabled="True" TickFrequency="1"
+                                Value="{Binding NoteMax, Mode=TwoWay}" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Row="1" Grid.Column="2" Text="{Binding NoteMaxText}" Style="{StaticResource FilterValue}" HorizontalAlignment="Right"/>
+                    </Grid>
+
+                    <!-- ===== VELOCITY ===== -->
+                    <TextBlock Text="VELOCITY" Style="{StaticResource FilterSectionHeader}"/>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="Curve" Style="{StaticResource FilterLabel}"/>
+                        <ComboBox Grid.Column="1" HorizontalAlignment="Stretch" SelectedIndex="{Binding VelocityCurveIndex, Mode=TwoWay}">
+                            <ComboBoxItem Content="Linear (unchanged)"/>
+                            <ComboBoxItem Content="Soft (light touch plays louder)"/>
+                            <ComboBoxItem Content="Hard (play harder for loud)"/>
+                        </ComboBox>
+                        <TextBlock Grid.Row="1" Text="Adjust" Style="{StaticResource FilterLabel}"/>
+                        <ComboBox Grid.Row="1" Grid.Column="1" HorizontalAlignment="Stretch" Margin="0,8,0,0"
+                                  SelectedIndex="{Binding VelocityModeIndex, Mode=TwoWay}">
+                            <ComboBoxItem Content="No change"/>
+                            <ComboBoxItem Content="Limit to a range"/>
+                            <ComboBoxItem Content="Fixed value"/>
+                        </ComboBox>
+                    </Grid>
+
+                    <Grid Margin="0,6,0,0" Visibility="{Binding IsVelocityRange, Converter={StaticResource BoolToVis}}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="40"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="Minimum" Style="{StaticResource FilterLabel}"/>
+                        <Slider Grid.Column="1" Minimum="1" Maximum="127" IsSnapToTickEnabled="True" TickFrequency="1"
+                                Value="{Binding VelocityMin, Mode=TwoWay}" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="2" Text="{Binding VelocityMin}" Style="{StaticResource FilterValue}" HorizontalAlignment="Right"/>
+                        <TextBlock Grid.Row="1" Text="Maximum" Style="{StaticResource FilterLabel}"/>
+                        <Slider Grid.Row="1" Grid.Column="1" Minimum="1" Maximum="127" IsSnapToTickEnabled="True" TickFrequency="1"
+                                Value="{Binding VelocityMax, Mode=TwoWay}" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Row="1" Grid.Column="2" Text="{Binding VelocityMax}" Style="{StaticResource FilterValue}" HorizontalAlignment="Right"/>
+                    </Grid>
+
+                    <Grid Margin="0,6,0,0" Visibility="{Binding IsVelocityFixed, Converter={StaticResource BoolToVis}}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="40"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Value" Style="{StaticResource FilterLabel}"/>
+                        <Slider Grid.Column="1" Minimum="1" Maximum="127" IsSnapToTickEnabled="True" TickFrequency="1"
+                                Value="{Binding VelocityFixed, Mode=TwoWay}" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="2" Text="{Binding VelocityFixed}" Style="{StaticResource FilterValue}" HorizontalAlignment="Right"/>
+                    </Grid>
+
+                    <!-- ===== CHANNELS ===== -->
+                    <TextBlock Text="CHANNELS" Style="{StaticResource FilterSectionHeader}"/>
+
+                    <Grid>
+                        <TextBlock Text="Listen to" Style="{StaticResource FilterLabel}"/>
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button Content="All" Padding="10,2" Click="AllChannels_Click"/>
+                            <Button Content="None" Padding="10,2" Margin="6,0,0,0" Click="NoChannels_Click"/>
+                        </StackPanel>
+                    </Grid>
+                    <ItemsControl ItemsSource="{Binding InputChannels}" Margin="-2,6,-2,0">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <UniformGrid Columns="8"/>
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <ToggleButton Content="{Binding Number}" IsChecked="{Binding IsAllowed, Mode=TwoWay}"
+                                              Height="32" MinWidth="0" Padding="0" Margin="2" HorizontalAlignment="Stretch"/>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <Grid Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Send on channel" Style="{StaticResource FilterLabel}"/>
+                        <ComboBox Grid.Column="1" HorizontalAlignment="Stretch" SelectedIndex="{Binding OutputChannel, Mode=TwoWay}">
+                            <ComboBoxItem Content="Unchanged"/>
+                            <ComboBoxItem Content="1"/>
+                            <ComboBoxItem Content="2"/>
+                            <ComboBoxItem Content="3"/>
+                            <ComboBoxItem Content="4"/>
+                            <ComboBoxItem Content="5"/>
+                            <ComboBoxItem Content="6"/>
+                            <ComboBoxItem Content="7"/>
+                            <ComboBoxItem Content="8"/>
+                            <ComboBoxItem Content="9"/>
+                            <ComboBoxItem Content="10"/>
+                            <ComboBoxItem Content="11"/>
+                            <ComboBoxItem Content="12"/>
+                            <ComboBoxItem Content="13"/>
+                            <ComboBoxItem Content="14"/>
+                            <ComboBoxItem Content="15"/>
+                            <ComboBoxItem Content="16"/>
+                        </ComboBox>
+                    </Grid>
+
+                    <!-- ===== MESSAGE TYPES ===== -->
+                    <TextBlock Text="MESSAGES FORWARDED" Style="{StaticResource FilterSectionHeader}"/>
+                    <UniformGrid Columns="2">
+                        <CheckBox Content="Control Change" IsChecked="{Binding PassControlChange, Mode=TwoWay}"/>
+                        <CheckBox Content="Pitch bend" IsChecked="{Binding PassPitchBend, Mode=TwoWay}"/>
+                        <CheckBox Content="Program change" IsChecked="{Binding PassProgramChange, Mode=TwoWay}"/>
+                        <CheckBox Content="SysEx" IsChecked="{Binding PassSysEx, Mode=TwoWay}"/>
+                        <CheckBox Content="Channel aftertouch" IsChecked="{Binding PassChannelPressure, Mode=TwoWay}"/>
+                        <CheckBox Content="Poly aftertouch" IsChecked="{Binding PassPolyPressure, Mode=TwoWay}"/>
+                        <CheckBox Content="Clock &amp; transport" IsChecked="{Binding PassClock, Mode=TwoWay}"
+                                  ToolTip="MIDI clock, Start, Stop, Continue, Song position"/>
+                        <CheckBox Content="Active sensing" IsChecked="{Binding PassActiveSensing, Mode=TwoWay}"/>
+                    </UniformGrid>
+
+                    <!-- ===== CC REMAP ===== -->
+                    <TextBlock Text="CC REMAP" Style="{StaticResource FilterSectionHeader}"/>
+                    <TextBlock Text="No remap: controllers are sent unchanged." Style="{StaticResource FilterValue}">
+                        <TextBlock.Visibility>
+                            <Binding Path="CcRemaps.Count">
+                                <Binding.Converter>
+                                    <local:ZeroToVisibleConverter/>
+                                </Binding.Converter>
+                            </Binding>
+                        </TextBlock.Visibility>
+                    </TextBlock>
+                    <ItemsControl ItemsSource="{Binding CcRemaps}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="CC" Style="{StaticResource FilterLabel}"/>
+                                    <ui:NumberBox Grid.Column="1" Minimum="0" Maximum="127" SpinButtonPlacementMode="Compact"
+                                                  Value="{Binding From, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                    <materialDesign:PackIcon Grid.Column="2" Kind="ArrowRight" Width="18" Height="18"
+                                                             VerticalAlignment="Center" Margin="8,0"/>
+                                    <TextBlock Grid.Column="3" Text="CC" Style="{StaticResource FilterLabel}"/>
+                                    <ui:NumberBox Grid.Column="4" Minimum="0" Maximum="127" SpinButtonPlacementMode="Compact"
+                                                  Value="{Binding To, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                                    <Button Grid.Column="5" Margin="6,0,0,0" Padding="6" ToolTip="Remove this remap"
+                                            Tag="{Binding DataContext, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                            Click="RemoveCcRemap_Click">
+                                        <materialDesign:PackIcon Kind="Close" Width="16" Height="16"/>
+                                    </Button>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <Button HorizontalAlignment="Left" Margin="0,6,0,4" Padding="10,4" Click="AddCcRemap_Click">
+                        <StackPanel Orientation="Horizontal">
+                            <materialDesign:PackIcon Kind="Plus" Width="16" Height="16" VerticalAlignment="Center"/>
+                            <TextBlock Text="Add remap" Margin="6,0,0,0"/>
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+            </ScrollViewer>
+        </ui:Flyout>
     </Window.Resources>
 
     <DockPanel Margin="10">
-        <!-- Top bar: Add link, Refresh, Status, Disable all, Theme selector -->
+        <!-- Top bar: Add link, Refresh, Disable all, Settings -->
         <Grid DockPanel.Dock="Top" Margin="0,0,0,4">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
@@ -27,7 +274,8 @@
 
             <StackPanel Orientation="Horizontal" Grid.Column="0">
                 <Button Content="＋ Add link" Width="95" Height="30" Margin="4,0,8,0" Click="AddConnection_Click"/>
-                <Button Content="Refresh" Width="95" Height="30" Margin="0,0,8,0" Click="RefreshButton_Click"/>
+                <Button Content="Refresh" Width="95" Height="30" Margin="0,0,8,0" Click="RefreshButton_Click"
+                        ToolTip="Rescan MIDI devices and retry failed links (devices are also detected automatically)"/>
             </StackPanel>
             <ToggleButton x:Name="DisableAllButton"
                           Content="Disable all"
@@ -37,111 +285,101 @@
                           Width="95"
                           Height="30"/>
 
-            <!-- Theme selector ComboBox -->
-            <ComboBox x:Name="ThemeSelector" Grid.Column="2" Width="45"
-              HorizontalAlignment="Left"
-              VerticalAlignment="Top"
-              Background="Transparent"
-              BorderBrush="Transparent"
-              Padding="4,0,0,0"
-              Margin="10,5,5,5"
-              SelectionChanged="ThemeSelector_SelectionChanged"
-              FontWeight="Medium">
-                <ComboBox.Template>
-                    <ControlTemplate TargetType="ComboBox">
-                        <Grid>
-                            <!-- Displayed area -->
-                            <ToggleButton x:Name="ToggleButton"
-                              Background="Transparent"
-                              BorderBrush="{TemplateBinding BorderBrush}"
-                              BorderThickness="{TemplateBinding BorderThickness}"
-                              IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
-                              Focusable="False">
-                                <ContentPresenter Margin="4"
-                                      VerticalAlignment="Center"
-                                      HorizontalAlignment="Left"
-                                      Content="{TemplateBinding SelectionBoxItem}"/>
-                            </ToggleButton>
+            <!-- Settings button: opens a flyout with the application settings -->
+            <Button x:Name="SettingsButton" Click="SettingsButton_Click" Grid.Column="2" Width="40" Height="30" Padding="0"
+                    Margin="8,0,4,0" ToolTip="Settings">
+                <materialDesign:PackIcon Kind="Cog" Width="20" Height="20"/>
+                <ui:FlyoutService.Flyout>
+                    <ui:Flyout Placement="BottomEdgeAlignedRight">
+                        <StackPanel Width="260">
+                            <TextBlock Text="Settings" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
 
-                            <!-- Popup with rounded corners -->
-                            <Popup x:Name="PART_Popup"
-                       Placement="Bottom"
-                       IsOpen="{TemplateBinding IsDropDownOpen}"
-                       AllowsTransparency="True"
-                       Focusable="False"
-                       PopupAnimation="Slide">
-                                <Border BorderBrush="Gray"
-                            BorderThickness="0"
-                            Background="{DynamicResource SystemControlBackgroundAltHighBrush}"
-                            CornerRadius="8"
-                            SnapsToDevicePixels="True">
-                                    <ScrollViewer>
-                                        <ItemsPresenter/>
-                                    </ScrollViewer>
-                                </Border>
-                            </Popup>
-                        </Grid>
-                    </ControlTemplate>
-                </ComboBox.Template>
+                            <!-- Theme -->
+                            <TextBlock Text="Theme" Margin="0,0,0,6"/>
+                            <!-- Items left-aligned explicitly: the closed box would otherwise center
+                                 the selection until the list has been opened once -->
+                            <ComboBox x:Name="ThemeSelector" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                      SelectionChanged="ThemeSelector_SelectionChanged">
+                                <ComboBoxItem Tag="Light" HorizontalContentAlignment="Left">
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Left">
+                                        <materialDesign:PackIcon Kind="WeatherSunny" Width="20" Height="20" Foreground="Gold"/>
+                                        <TextBlock Margin="8,0,0,0" Text="Light"/>
+                                    </StackPanel>
+                                </ComboBoxItem>
+                                <ComboBoxItem Tag="Dark" HorizontalContentAlignment="Left">
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Left">
+                                        <materialDesign:PackIcon Kind="WeatherNight" Width="20" Height="20" Foreground="DarkSlateBlue"/>
+                                        <TextBlock Margin="8,0,0,0" Text="Dark"/>
+                                    </StackPanel>
+                                </ComboBoxItem>
+                                <ComboBoxItem Tag="System" HorizontalContentAlignment="Left">
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Left">
+                                        <materialDesign:PackIcon Kind="ThemeLightDark" Width="20" Height="20"/>
+                                        <TextBlock Margin="8,0,0,0" Text="System"/>
+                                    </StackPanel>
+                                </ComboBoxItem>
+                            </ComboBox>
 
-                <!-- Style for rounded ComboBox items -->
-                <ComboBox.ItemContainerStyle>
-                    <Style TargetType="ComboBoxItem">
-                        <Setter Property="Template">
-                            <Setter.Value>
-                                <ControlTemplate TargetType="ComboBoxItem">
-                                    <Border x:Name="Bd"
-                                CornerRadius="8"
-                                Padding="10,8,10,8"
-                                Background="Transparent">
-                                        <ContentPresenter />
-                                    </Border>
-                                    <ControlTemplate.Triggers>
-                                        <!-- Hover -->
-                                        <Trigger Property="IsMouseOver" Value="True">
-                                            <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SystemControlBackgroundBaseLowBrush}"/>
-                                        </Trigger>
-                                        <!-- Selected -->
-                                        <Trigger Property="IsSelected" Value="True">
-                                            <Setter TargetName="Bd" Property="Background" Value="{DynamicResource SystemControlHighlightAccentBrush}"/>
-                                            <Setter Property="Foreground" Value="{DynamicResource AccentButtonForeground}" />
-                                        </Trigger>
-                                    </ControlTemplate.Triggers>
-                                </ControlTemplate>
-                            </Setter.Value>
-                        </Setter>
-                    </Style>
-                </ComboBox.ItemContainerStyle>
+                            <!-- Accent color: swatches, the first one follows Windows -->
+                            <TextBlock Text="Accent color" Margin="0,16,0,6"/>
+                            <ListBox x:Name="AccentSelector" SelectionChanged="AccentSelector_SelectionChanged"
+                                     Background="Transparent" BorderThickness="0" Padding="0" Margin="-2,0"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel/>
+                                    </ItemsPanelTemplate>
+                                </ListBox.ItemsPanel>
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="Cursor" Value="Hand"/>
+                                        <Setter Property="ToolTip" Value="{Binding Name}"/>
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="ListBoxItem">
+                                                    <Grid Width="34" Height="34" Background="Transparent">
+                                                        <!-- Ring: selected (full) or hovered (faint) -->
+                                                        <Ellipse x:Name="Ring" Margin="1" StrokeThickness="2" Opacity="0"
+                                                                 Stroke="{DynamicResource SystemControlForegroundBaseHighBrush}"/>
+                                                        <Ellipse Margin="5" Fill="{Binding Swatch}"/>
+                                                        <materialDesign:PackIcon x:Name="WindowsIcon" Kind="MicrosoftWindows"
+                                                                                 Width="12" Height="12" Foreground="White"
+                                                                                 HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                                                 Visibility="Collapsed"/>
+                                                    </Grid>
+                                                    <ControlTemplate.Triggers>
+                                                        <DataTrigger Binding="{Binding IsSystem}" Value="True">
+                                                            <Setter TargetName="WindowsIcon" Property="Visibility" Value="Visible"/>
+                                                        </DataTrigger>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter TargetName="Ring" Property="Opacity" Value="0.4"/>
+                                                        </Trigger>
+                                                        <Trigger Property="IsSelected" Value="True">
+                                                            <Setter TargetName="Ring" Property="Opacity" Value="1"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
+                            </ListBox>
 
-                <!-- Light theme -->
-                <ComboBoxItem Tag="Light">
-                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <materialDesign:PackIcon Kind="WeatherSunny" 
-                                     Width="20" Height="20" 
-                                     Foreground="Gold"/>
-                        <TextBlock Margin="6,0,0,0" Text="Light"/>
-                    </StackPanel>
-                </ComboBoxItem>
+                            <!-- Launch at Windows startup -->
+                            <ui:ToggleSwitch x:Name="StartupSwitch" Header="Launch at Windows startup"
+                                             Margin="0,16,0,0" Toggled="StartupSwitch_Toggled"
+                                             ToolTip="Starts MIDILINK minimized when you log in to Windows"/>
+                            <TextBlock x:Name="StartupNote" Visibility="Collapsed" TextWrapping="Wrap" FontSize="12"
+                                       Foreground="DarkOrange" Margin="0,4,0,0"/>
 
-                <!-- Dark theme -->
-                <ComboBoxItem Tag="Dark">
-                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <materialDesign:PackIcon Kind="WeatherNight"
-                                     Width="20" Height="20" 
-                                     Foreground="DarkSlateBlue"/>
-                        <TextBlock Margin="6,0,0,0" Text="Dark"/>
-                    </StackPanel>
-                </ComboBoxItem>
-
-                <!-- System theme -->
-                <ComboBoxItem Tag="System">
-                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <materialDesign:PackIcon Kind="ThemeLightDark"
-                                     Width="20" Height="20"/>
-                        <TextBlock Margin="6,0,0,0" Text="System"/>
-                    </StackPanel>
-                </ComboBoxItem>
-            </ComboBox>
+                            <!-- Minimize to tray -->
+                            <ui:ToggleSwitch x:Name="TraySwitch" Header="Minimize to system tray"
+                                             Margin="0,12,0,0" Toggled="TraySwitch_Toggled"
+                                             ToolTip="When minimized, MIDILINK hides in the notification area instead of the taskbar"/>
+                        </StackPanel>
+                    </ui:Flyout>
+                </ui:FlyoutService.Flyout>
+            </Button>
         </Grid>
 
         <!-- Keyboard Bottom Panel -->
@@ -314,11 +552,13 @@
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <ToggleButton x:Name="ToggleKeyboardPanel" Grid.Column="0" Width="40" Height="30" Margin="0,4,8,0"
                             Checked="ToggleKeyboardPanel_Checked"
                             Unchecked="ToggleKeyboardPanel_Unchecked"
-                            Padding="0">
+                            Padding="0"
+                            ToolTip="Show a visual keyboard">
                             <ToggleButton.Style>
                                 <Style TargetType="ToggleButton" BasedOn="{StaticResource {x:Type ToggleButton}}">
                                     <Style.Triggers>
@@ -341,6 +581,12 @@
                             DisplayMemberPath="Display"
                             HorizontalAlignment="Stretch"
                             Visibility="Hidden"/>
+
+                        <!-- Shown when the keyboard output does not answer (switched off but still listed...) -->
+                        <materialDesign:PackIcon x:Name="KeyboardWarning" Grid.Column="2" Kind="AlertCircleOutline"
+                            Width="22" Height="22" Margin="0,4,8,0" VerticalAlignment="Center"
+                            Foreground="DarkOrange" Visibility="Collapsed" Background="Transparent"
+                            ToolTip="This device is not responding (switched off?). Notes are not delivered."/>
                     </Grid>
                 </StackPanel>
 
@@ -362,7 +608,33 @@
                                 <Grid Margin="0,0,8,4">
                                     <!-- Vertical stack for IN/OUT selection -->
                                     <StackPanel>
-                                        <TextBlock Text="IN" FontWeight="Bold" Margin="4,0,0,4"/>
+                                        <Grid Margin="4,0,0,4">
+                                            <TextBlock Text="IN" FontWeight="Bold"/>
+                                            <!-- Connection state -->
+                                            <TextBlock Text="{Binding StateText}" HorizontalAlignment="Right" FontSize="12"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="220"
+                                                       ToolTip="{Binding StateText}">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Foreground" Value="Gray"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding State}" Value="Connected">
+                                                                <Setter Property="Foreground" Value="MediumSeaGreen"/>
+                                                            </DataTrigger>
+                                                            <DataTrigger Binding="{Binding State}" Value="DeviceMissing">
+                                                                <Setter Property="Foreground" Value="DarkOrange"/>
+                                                            </DataTrigger>
+                                                            <DataTrigger Binding="{Binding State}" Value="NotResponding">
+                                                                <Setter Property="Foreground" Value="DarkOrange"/>
+                                                            </DataTrigger>
+                                                            <DataTrigger Binding="{Binding State}" Value="Error">
+                                                                <Setter Property="Foreground" Value="IndianRed"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </Grid>
                                         <ComboBox x:Name="InCombo"
                                         ItemsSource="{Binding DataContext.InDevices, RelativeSource={RelativeSource AncestorType=Window}}"
                                         SelectedValue="{Binding InId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
@@ -386,18 +658,55 @@
                                      HorizontalAlignment="Center"
                                      VerticalAlignment="Center"
                                      Margin="0,25,0,0"/>
+                                    <materialDesign:PackIcon Kind="Close"
+                                     Width="31" Height="31" 
+                                     Foreground="Gray"
+                                     HorizontalAlignment="Center"
+                                     VerticalAlignment="Center"
+                                     Margin="1,25,0,0">
+                                        <materialDesign:PackIcon.Style>
+                                            <Style TargetType="materialDesign:PackIcon">
+                                                <Setter Property="Visibility" Value="Hidden"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsInactive}" Value="True">
+                                                        <Setter Property="Visibility" Value="Visible"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </materialDesign:PackIcon.Style>
+                                    </materialDesign:PackIcon>
                                 </Grid>
 
-                                <StackPanel Grid.Column="1">
+                                <StackPanel Grid.Column="1" Width="146">
                                     <!-- Enable/Disable connection -->
-                                    <ToggleButton Grid.Column="1"
-                                              IsChecked="{Binding IsInactive, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                    <ToggleButton IsChecked="{Binding IsInactive, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                               Content="{Binding ActiveLabel}"
-                                              MinWidth="110" Height="45" Margin="4,15,4,4"/>
+                                              HorizontalAlignment="Stretch" Height="45" Margin="4,15,4,4"/>
 
-                                    <!-- Delete connection -->
-                                    <Button Grid.Column="2" Content="Delete" MinWidth="110" Height="45" Margin="4,9,4,4"
-                                        Click="RemoveConnection_Click"/>
+                                    <!-- Filters / Delete -->
+                                    <UniformGrid Columns="2" Margin="2,5,2,0">
+                                        <!-- Filters: accent colored while a filter is active; tooltip lists them -->
+                                        <Button Height="45" Margin="2" Padding="0" HorizontalAlignment="Stretch"
+                                                Click="Filters_Click" ToolTip="{Binding Filter.Summary}">
+                                            <Button.Style>
+                                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding Filter.IsActive}" Value="True">
+                                                            <Setter Property="Background" Value="{DynamicResource SystemControlHighlightAccentBrush}"/>
+                                                            <Setter Property="Foreground" Value="White"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Button.Style>
+                                            <materialDesign:PackIcon Kind="FilterVariant" Width="20" Height="20"/>
+                                        </Button>
+
+                                        <!-- Delete connection -->
+                                        <Button Height="45" Margin="2" Padding="0" HorizontalAlignment="Stretch"
+                                                Click="RemoveConnection_Click" ToolTip="Delete this link">
+                                            <materialDesign:PackIcon Kind="TrashCanOutline" Width="20" Height="20"/>
+                                        </Button>
+                                    </UniformGrid>
                                 </StackPanel>
                             </Grid>
                         </Border>
