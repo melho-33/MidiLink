@@ -83,6 +83,8 @@ namespace MidiLink
             _devices.IsInUse = IsDeviceInUse;
             _devices.DeviceRemoved += id => _ports.Invalidate(id);
             _devices.DevicesChanged += OnDevicesChanged;
+            // A Bluetooth device switched back on gets fresh opens, not the ones stuck while it was off
+            _devices.BeforeBluetoothUpdate = _ports.ForceRetryStuckOpens;
 
             // A port that stopped working (e.g. Bluetooth timeout) is dropped by the manager: reopen it
             _ports.PortFailed += _ => Dispatcher.BeginInvoke(ReconnectAll);
@@ -250,13 +252,23 @@ namespace MidiLink
         }
 
         /// <summary>
-        /// Rescans the MIDI devices and retries the connections that are not working.
+        /// Rescans the MIDI devices and reopens every connection from scratch (like Disable / Enable):
+        /// a port can look open while not working, e.g. a Bluetooth device opened while still connecting.
         /// </summary>
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                await _devices.RescanAsync(); // raises DevicesChanged, which updates the connections
+                AppLog.Info("Refresh: reopening all connections");
+                _ports.ForceRetryStuckOpens(); // the user asks for it: skip the waiting delays
+
+                // Give every port back (they close once unused), then reopen through the rescan below
+                foreach (var row in Connections)
+                    row.Close();
+                _keyboardLease?.Dispose();
+                _keyboardLease = null;
+
+                await _devices.RescanAsync(); // raises DevicesChanged, which reopens the connections
             }
             catch (Exception ex)
             {
@@ -894,7 +906,7 @@ namespace MidiLink
             _keyboardLease?.Dispose();
             _keyboardLease = null;
 
-            if (string.IsNullOrWhiteSpace(outId) || !_devices.IsAvailable(outId, isOut: true))
+            if (string.IsNullOrWhiteSpace(outId) || !_devices.IsAvailable(outId, isOut: true) || !_devices.IsReachable(outId, isOut: true))
                 return;
 
             try

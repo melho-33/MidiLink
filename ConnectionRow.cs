@@ -202,40 +202,38 @@ namespace MidiLink
             if (!outOk)
                 ReleaseOutput();
 
-            SetState(ConnectionState.Connecting, "Connecting...");
+            // A Bluetooth device switched off keeps its ports listed, but opening them blocks the whole
+            // Windows MIDI stack: don't even try, it reconnects as soon as the device is detected again
+            if ((!inOk && !devices.IsReachable(InId, isOut: false)) || (!outOk && !devices.IsReachable(OutId, isOut: true)))
+            {
+                SetState(ConnectionState.DeviceMissing, "Bluetooth device off or out of range");
+                return;
+            }
+
+            // Background retry of a link in error: keep showing the error instead of flashing "Connecting..."
+            if (State == ConnectionState.Error)
+                StateText = _lastError + " (retrying)";
+            else
+                SetState(ConnectionState.Connecting, "Connecting...");
+
             string inId = InId!, outId = OutId!;
             var inTask = inOk ? null : ports.AcquireInAsync(inId, OnMessage);
             var outTask = outOk ? null : ports.AcquireOutAsync(outId);
+
+            // Both open in parallel (each has its own timeout); each side is kept if it succeeds,
+            // so a retry only reopens the side that failed
             InPortLease? newIn = null;
             OutPortLease? newOut = null;
-            try
+            Exception? error = null;
+            if (inTask != null)
             {
-                // Both open in parallel (each has its own timeout)
-                if (inTask != null)
-                {
-                    try
-                    {
-                        newIn = await inTask;
-                    }
-                    catch
-                    {
-                        _ = outTask?.ContinueWith(t =>
-                        {
-                            if (t.IsCompletedSuccessfully) t.Result.Dispose();
-                            else _ = t.Exception;
-                        });
-                        throw;
-                    }
-                }
-                if (outTask != null)
-                    newOut = await outTask;
+                try { newIn = await inTask; }
+                catch (Exception ex) { error = ex; }
             }
-            catch (Exception ex)
+            if (outTask != null)
             {
-                newIn?.Dispose();
-                if (version == _version)
-                    SetState(ConnectionState.Error, ex.Message);
-                return;
+                try { newOut = await outTask; }
+                catch (Exception ex) { error ??= ex; }
             }
 
             // Settings changed while we were opening: this result is obsolete
@@ -248,8 +246,19 @@ namespace MidiLink
 
             if (newIn != null) _inLease = newIn;
             if (newOut != null) _outLease = newOut;
+
+            if (error != null)
+            {
+                _lastError = error.Message;
+                SetState(ConnectionState.Error, _lastError);
+                return;
+            }
+
             SetConnected(ports);
         }
+
+        // Message of the last opening error, kept while retrying in the background
+        private string _lastError = "";
 
         /// <summary>
         /// Connected, unless the output is known as not responding (still listed by Windows but switched off...).

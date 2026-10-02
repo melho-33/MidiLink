@@ -12,6 +12,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Windows.Devices.Midi;
+using Windows.Foundation;
 
 namespace MidiLink
 {
@@ -70,8 +71,13 @@ namespace MidiLink
         public async Task<InPortLease> AcquireInAsync(string id, Action<IMidiMessage> handler)
         {
             var entry = await AcquireAsync(_ins, id, isInput: true);
-            entry.AddSubscriber(handler);
-            return new InPortLease(this, entry, handler);
+
+            // A distinct delegate per lease: two leases of the same link (overlapping updates) would
+            // otherwise share an equal delegate, and disposing one would unsubscribe the other too
+            // (the link then shows "Connected" but no message goes through)
+            Action<IMidiMessage> subscription = message => handler(message);
+            entry.AddSubscriber(subscription);
+            return new InPortLease(this, entry, subscription);
         }
 
         /// <summary>
@@ -145,7 +151,7 @@ namespace MidiLink
             {
                 if (entry.IsInput)
                 {
-                    var port = await OpenWithTimeoutAsync(async () => await MidiInPort.FromIdAsync(entry.Id))
+                    var port = await OpenWithTimeoutAsync("IN:" + entry.Id, Guarded(() => MidiInPort.FromIdAsync(entry.Id)))
                         ?? throw new InvalidOperationException("MIDI input unavailable (used by another app?)");
                     port.MessageReceived += entry.OnMessageReceived;
                     if (!entry.SetInPort(port))
@@ -153,7 +159,7 @@ namespace MidiLink
                 }
                 else
                 {
-                    var port = await OpenWithTimeoutAsync(async () => await MidiOutPort.FromIdAsync(entry.Id))
+                    var port = await OpenWithTimeoutAsync("OUT:" + entry.Id, Guarded(() => MidiOutPort.FromIdAsync(entry.Id)))
                         ?? throw new InvalidOperationException("MIDI output unavailable (used by another app?)");
                     lock (_sync) entry.Suspect = _notResponding.Contains(entry.Id);
                     if (!entry.StartSender(port))
@@ -182,24 +188,151 @@ namespace MidiLink
             }
         }
 
+        // Native open operations that failed, returned nothing or answered late. They are never released:
+        // crash dumps show Windows crashing (pure virtual call, in the finalizer thread) when such an
+        // operation for an unresponsive Bluetooth device is destroyed. Keeping them costs a few bytes
+        // each, and there is at most one per port per minute.
+        private static readonly List<object> _keptOperations = new();
+
+        /// <summary>
+        /// Wraps a WinRT FromIdAsync call so that an operation which did not complete normally and quickly
+        /// is kept alive forever instead of being destroyed by the garbage collector.
+        /// </summary>
+        private static Func<Task<T?>> Guarded<T>(Func<IAsyncOperation<T>> start) where T : class => async () =>
+        {
+            var started = Stopwatch.StartNew();
+            var operation = start();
+            bool clean = false;
+            try
+            {
+                var result = await operation;
+                clean = result != null && started.Elapsed < OpenTimeout;
+                return result;
+            }
+            finally
+            {
+                if (!clean)
+                {
+                    lock (_keptOperations)
+                    {
+                        _keptOperations.Add(operation);
+                        AppLog.Info($"Keeping a failed/slow MIDI open operation alive ({_keptOperations.Count} kept)");
+                    }
+                }
+            }
+        };
+
+        // How long a port that finished opening after its timeout is kept for the next attempt
+        private static readonly TimeSpan LateOpenKeep = TimeSpan.FromSeconds(30);
+
+        // Native open calls still running or not yet claimed, per port ("IN:id" / "OUT:id").
+        // Never two opens of the same port at once: a retry joins the pending one (a slow Bluetooth
+        // device, e.g. after the PC wakes up, could otherwise get stacked concurrent opens).
+        private readonly Dictionary<string, Task<IDisposable?>> _rawOpens = new();
+        private readonly Dictionary<string, DateTime> _rawOpenStarted = new();
+
+        // A native open stuck longer than this is given up (released if it ever finishes) and a new one
+        // is allowed, so a device switched back on can still reconnect. Each new native open on a dead
+        // Bluetooth device stalls the whole Windows MIDI stack for a moment (other links' messages wait),
+        // so the delay doubles on each restart: 20 s, 40 s, 80 s... up to 10 min. Reset when the port opens.
+        // (Switched-off Bluetooth devices are not opened at all anymore; a stuck open is typically a
+        // device that has just been switched on, and a fresh open then succeeds right away.)
+        private static readonly TimeSpan MinPendingOpenAge = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan MaxPendingOpenAge = TimeSpan.FromMinutes(10);
+        private readonly Dictionary<string, int> _rawOpenRestarts = new();
+
+        private TimeSpan StuckDelay(string key)
+        {
+            _rawOpenRestarts.TryGetValue(key, out int restarts);
+            var delay = TimeSpan.FromTicks(MinPendingOpenAge.Ticks << Math.Min(restarts, 5));
+            return delay < MaxPendingOpenAge ? delay : MaxPendingOpenAge;
+        }
+
+        /// <summary>
+        /// Refresh button: allows an immediate new native open of ports stuck on an unresponsive device.
+        /// </summary>
+        public void ForceRetryStuckOpens()
+        {
+            lock (_sync)
+            {
+                _rawOpenRestarts.Clear();
+                foreach (var key in _rawOpenStarted.Keys.ToList())
+                    _rawOpenStarted[key] = DateTime.MinValue;
+            }
+        }
+
         /// <summary>
         /// Opens a port on a background thread so an unresponsive device cannot freeze the UI.
-        /// A port that opens after the timeout is released.
+        /// If it takes longer than the timeout, the open keeps running: a later attempt reuses it,
+        /// and a port that finally opens is kept for a while for that attempt, then released.
         /// </summary>
-        private static async Task<T?> OpenWithTimeoutAsync<T>(Func<Task<T?>> open) where T : class, IDisposable
+        private async Task<T?> OpenWithTimeoutAsync<T>(string key, Func<Task<T?>> open) where T : class, IDisposable
         {
-            var task = Task.Run(open);
-            if (await Task.WhenAny(task, Task.Delay(OpenTimeout)) != task)
+            Task<IDisposable?> raw;
+            lock (_sync)
             {
-                // Abandon the call, but release the port if it finally opens (and observe any error)
-                _ = task.ContinueWith(t =>
+                _rawOpens.TryGetValue(key, out var pending);
+                bool stuck = pending is { IsCompleted: false }
+                             && DateTime.UtcNow - _rawOpenStarted[key] > StuckDelay(key);
+                bool reusable = pending != null && !stuck
+                                && (!pending.IsCompleted || (pending.IsCompletedSuccessfully && pending.Result != null));
+
+                if (reusable)
                 {
+                    raw = pending!;
+                    AppLog.Info($"Waiting for the pending open of {key}");
+                }
+                else
+                {
+                    if (stuck)
+                    {
+                        // Give up on it, but still release the port if it ever opens
+                        AppLog.Info($"Open of {key} stuck for over {StuckDelay(key).TotalSeconds:0} s, trying again");
+                        _rawOpenRestarts[key] = _rawOpenRestarts.GetValueOrDefault(key) + 1;
+                        _ = pending!.ContinueWith(t =>
+                        {
+                            if (t.IsCompletedSuccessfully) { try { t.Result?.Dispose(); } catch { } }
+                            else _ = t.Exception;
+                        });
+                    }
+                    raw = Task.Run(async () => (IDisposable?)await open());
+                    _rawOpens[key] = raw;
+                    _rawOpenStarted[key] = DateTime.UtcNow;
+                }
+            }
+
+            if (await Task.WhenAny(raw, Task.Delay(OpenTimeout)) != raw)
+            {
+                // Leave it running; if nobody claims the result in time, release it
+                _ = raw.ContinueWith(async t =>
+                {
+                    await Task.Delay(LateOpenKeep);
+                    bool owned;
+                    lock (_sync)
+                    {
+                        owned = _rawOpens.TryGetValue(key, out var current) && current == t;
+                        if (owned) _rawOpens.Remove(key);
+                    }
+                    if (!owned) return; // claimed by a later attempt
                     if (t.IsCompletedSuccessfully) { try { t.Result?.Dispose(); } catch { } }
                     else _ = t.Exception;
                 });
                 throw new TimeoutException("MIDI device not responding");
             }
-            return await task;
+
+            // Finished: claim the result so nobody else uses (or disposes) the same native port
+            bool claimed;
+            lock (_sync)
+            {
+                claimed = _rawOpens.TryGetValue(key, out var current) && current == raw;
+                if (claimed) _rawOpens.Remove(key);
+                if (raw.IsCompletedSuccessfully && raw.Result != null)
+                    _rawOpenRestarts.Remove(key); // responding again: back to the short delay
+            }
+            var result = await raw; // rethrows if the open failed
+            if (!claimed)
+                throw new InvalidOperationException("MIDI port already taken by another attempt");
+            return (T?)result;
         }
 
         /// <summary>
@@ -565,7 +698,8 @@ namespace MidiLink
 
         public void RemoveSubscriber(Action<IMidiMessage> handler)
         {
-            lock (_portLock) _subscribers = _subscribers.Where(h => h != handler).ToArray();
+            // Exact instance only (delegate equality would also match other leases of the same handler)
+            lock (_portLock) _subscribers = _subscribers.Where(h => !ReferenceEquals(h, handler)).ToArray();
         }
 
         /// <summary>

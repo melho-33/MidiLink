@@ -23,12 +23,25 @@ namespace MidiLink
     public sealed class MidiDeviceService : IDisposable
     {
         private readonly Dispatcher _dispatcher;
+        private const string ContainerIdProperty = "System.Devices.ContainerId";
+        private static readonly string[] Properties = { ContainerIdProperty };
+
+        /// <summary>
+        /// Whether Bluetooth devices are switched on (their MIDI ports stay listed even when off).
+        /// </summary>
+        public BluetoothPresence Bluetooth { get; }
         private DeviceWatcher? _inWatcher;
         private DeviceWatcher? _outWatcher;
         private bool _inEnumerated;
         private bool _outEnumerated;
 
-        public MidiDeviceService(Dispatcher dispatcher) => _dispatcher = dispatcher;
+        public MidiDeviceService(Dispatcher dispatcher)
+        {
+            _dispatcher = dispatcher;
+            Bluetooth = new BluetoothPresence(dispatcher);
+            // A Bluetooth device switched on or off is handled like a plug / unplug
+            Bluetooth.Changed += OnBluetoothChanged;
+        }
 
         /// <summary>
         /// MIDI input devices (connected ones, plus disconnected ones still in use).
@@ -65,17 +78,19 @@ namespace MidiLink
         /// </summary>
         public void Start()
         {
+            Bluetooth.Start();
             _inWatcher = StartWatcher(MidiInPort.GetDeviceSelector(), isOut: false);
             _outWatcher = StartWatcher(MidiOutPort.GetDeviceSelector(), isOut: true);
         }
 
         private DeviceWatcher StartWatcher(string selector, bool isOut)
         {
-            var watcher = DeviceInformation.CreateWatcher(selector);
+            var watcher = DeviceInformation.CreateWatcher(selector, Properties);
             watcher.Added += (_, info) =>
             {
                 string id = info.Id, name = info.Name;
-                Post(() => OnAdded(isOut, id, name));
+                var container = ContainerOf(info);
+                Post(() => OnAdded(isOut, id, name, container));
             };
             watcher.Removed += (_, update) =>
             {
@@ -104,9 +119,9 @@ namespace MidiLink
             }
         }
 
-        private void OnAdded(bool isOut, string id, string name)
+        private void OnAdded(bool isOut, string id, string name, Guid? container)
         {
-            AddOrUpdate(isOut, id, name);
+            AddOrUpdate(isOut, id, name, container);
             AppLog.Info($"Device connected ({(isOut ? "OUT" : "IN")}): {name} {id}");
             FixOutNames();
             if (IsEnumerated) DevicesChanged?.Invoke();
@@ -116,6 +131,26 @@ namespace MidiLink
         {
             if (!MarkRemoved(isOut, id)) return;
             DeviceRemoved?.Invoke(id);
+            if (IsEnumerated) DevicesChanged?.Invoke();
+        }
+
+        /// <summary>
+        /// Called when a Bluetooth device is switched on or off, before the connections are updated.
+        /// </summary>
+        public Action? BeforeBluetoothUpdate { get; set; }
+
+        private void OnBluetoothChanged()
+        {
+            BeforeBluetoothUpdate?.Invoke();
+
+            // Ports of a device switched off stay listed but no longer work (the first message on them
+            // would block then fail): close them now, like an unplug, so they are reopened cleanly
+            // (with a reset) as soon as the device is detected again
+            foreach (var item in InDevices.Concat(OutDevices).ToList())
+            {
+                if (item.IsAvailable && Bluetooth.IsBluetooth(item.ContainerId) && !Bluetooth.IsDetected(item.ContainerId))
+                    DeviceRemoved?.Invoke(item.Id);
+            }
             if (IsEnumerated) DevicesChanged?.Invoke();
         }
 
@@ -134,8 +169,8 @@ namespace MidiLink
         /// </summary>
         public async Task RescanAsync()
         {
-            var ins = await DeviceInformation.FindAllAsync(MidiInPort.GetDeviceSelector());
-            var outs = await DeviceInformation.FindAllAsync(MidiOutPort.GetDeviceSelector());
+            var ins = await DeviceInformation.FindAllAsync(MidiInPort.GetDeviceSelector(), Properties);
+            var outs = await DeviceInformation.FindAllAsync(MidiOutPort.GetDeviceSelector(), Properties);
 
             Reconcile(isOut: false, ins);
             Reconcile(isOut: true, outs);
@@ -148,7 +183,7 @@ namespace MidiLink
             var present = new HashSet<string>(infos.Select(i => i.Id));
 
             foreach (var info in infos)
-                AddOrUpdate(isOut, info.Id, info.Name);
+                AddOrUpdate(isOut, info.Id, info.Name, ContainerOf(info));
 
             foreach (var item in List(isOut).Where(d => d.IsAvailable && !present.Contains(d.Id)).ToList())
             {
@@ -157,18 +192,22 @@ namespace MidiLink
             }
         }
 
-        private void AddOrUpdate(bool isOut, string id, string name)
+        private static Guid? ContainerOf(DeviceInformation info) =>
+            info.Properties.TryGetValue(ContainerIdProperty, out var c) && c is Guid g ? g : null;
+
+        private void AddOrUpdate(bool isOut, string id, string name, Guid? container)
         {
             var item = Find(id, isOut);
             if (item == null)
             {
-                List(isOut).Add(new DeviceItem(id, name, isAvailable: true));
+                List(isOut).Add(new DeviceItem(id, name, isAvailable: true) { ContainerId = container });
             }
             else
             {
                 item.RawName = name;
                 item.Name = name;
                 item.IsAvailable = true;
+                item.ContainerId = container;
             }
         }
 
@@ -218,6 +257,11 @@ namespace MidiLink
         public bool IsAvailable(string? id, bool isOut) => Find(id, isOut)?.IsAvailable == true;
 
         /// <summary>
+        /// False for a Bluetooth device known to be switched off (its port is listed but would not open).
+        /// </summary>
+        public bool IsReachable(string? id, bool isOut) => Bluetooth.IsReachable(Find(id, isOut)?.ContainerId);
+
+        /// <summary>
         /// Windows often names outputs just "MIDI": use the name of the input with the same short ID.
         /// </summary>
         private void FixOutNames()
@@ -245,6 +289,7 @@ namespace MidiLink
         /// </summary>
         public void Dispose()
         {
+            Bluetooth.Dispose();
             foreach (var watcher in new[] { _inWatcher, _outWatcher })
             {
                 try

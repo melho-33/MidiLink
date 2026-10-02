@@ -38,6 +38,11 @@ namespace MidiLink
         public string ShortId { get; }
 
         /// <summary>
+        /// Physical device the port belongs to (links a Bluetooth MIDI port to its Bluetooth device).
+        /// </summary>
+        public Guid? ContainerId { get; set; }
+
+        /// <summary>
         /// Name reported by Windows (may be the generic "MIDI" for outputs).
         /// </summary>
         public string RawName { get; set; }
